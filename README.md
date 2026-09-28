@@ -1,5 +1,15 @@
 # esphome-vpd-regler
 
+> [!WARNING]
+> **This repository was created entirely with AI.** The code, the
+> documentation and the tests were written by an AI assistant.
+>
+> I have tested it myself in my own grow tent, but my tests cannot cover
+> every setup, fan, sensor and failure case. Use it with care: watch the
+> controller closely at the beginning, keep the safety limits set sensibly
+> and do not leave it unsupervised where a wrong fan setting could harm your
+> plants or equipment. It comes without any warranty (see [LICENSE](LICENSE)).
+
 An [ESPHome](https://esphome.io) external component that controls the
 **VPD (vapour pressure deficit)** of a grow tent with a single exhaust fan.
 
