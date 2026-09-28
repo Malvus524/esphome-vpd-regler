@@ -112,6 +112,21 @@ external_components:
 
 Pin a tag (`@v1.0.0`) so updates only arrive when you choose.
 
+### Testing the development version
+
+New features are tested on the `dev` branch before they are released as a
+tag. To try them, use the branch name instead of the tag:
+
+```yaml
+external_components:
+  - source: github://Malvus524/esphome-vpd-regler@dev
+    components: [vpd_kalman]
+    refresh: 1h                # how often ESPHome checks for new commits
+```
+
+`dev` may be unfinished and can change or break at any time. For a tent that
+has to run unattended, stay on a tag. To go back, set the tag again.
+
 ## Minimal configuration
 
 ```yaml
