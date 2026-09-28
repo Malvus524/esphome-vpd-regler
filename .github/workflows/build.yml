@@ -1,0 +1,69 @@
+# Compiles example.yaml against the component in this repository.
+# Nothing is flashed - this only checks that the build still works.
+#  - on pushes/PRs that touch the component or the example
+#  - weekly against the newest ESPHome release and beta
+#  - manually via "Run workflow" in the Actions tab
+name: Build
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "components/**"
+      - "example.yaml"
+      - ".github/workflows/build.yml"
+  pull_request:
+    paths:
+      - "components/**"
+      - "example.yaml"
+      - ".github/workflows/build.yml"
+  schedule:
+    - cron: "0 5 * * 1" # Mondays 05:00 UTC
+  workflow_dispatch:
+
+jobs:
+  compile:
+    name: ESPHome ${{ matrix.esphome }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # stable = newest release, beta = next release (early warning)
+        esphome: [stable, beta]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ESPHome
+        run: |
+          if [ "${{ matrix.esphome }}" = "beta" ]; then
+            pip install --pre esphome
+          else
+            pip install esphome
+          fi
+          esphome version
+
+      - name: Prepare config
+        run: |
+          # Use the component from this checkout instead of the release tag
+          sed 's#github://Malvus524/esphome-vpd-regler@[^ ]*#components#' \
+            example.yaml > ci.yaml
+          grep -q 'source: components' ci.yaml
+          # Dummy secrets, only needed to compile
+          cat > secrets.yaml <<EOF
+          wifi_ssid: "ci"
+          wifi_password: "ci-password"
+          api_encryption_key: "$(openssl rand -base64 32)"
+          EOF
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ matrix.esphome }}-${{ hashFiles('example.yaml') }}
+          restore-keys: platformio-${{ matrix.esphome }}-
+
+      - name: Compile
+        run: esphome compile ci.yaml
