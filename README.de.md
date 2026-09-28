@@ -275,6 +275,14 @@ Number-Optionen (`name`, `id`, `icon`, `entity_category`, ...) sowie
 
 ### Schalter
 
+Die Spalte *Wiederherstellung* sagt, wie ein Schalter nach einem Neustart
+(Stromausfall, OTA-Update, Reset) steht. *Standard aus* und *Standard an*
+heißen: Der Schalter steht wieder so wie vor dem Neustart. Aus bzw. an gilt
+nur, wenn noch nichts gespeichert ist, also beim allerersten Start oder
+nachdem du seinen `name` geändert hast. *immer aus* heißt: nach jedem
+Neustart aus. Ändern kannst du das mit der üblichen Schalter-Option
+`restore_mode`.
+
 | Schlüssel | Standardname | Wiederherstellung | Bedeutung |
 |---|---|---|---|
 | `control` | VPD control | Standard aus | ON = der Regler steuert den Lüfter (übernimmt die aktuelle Drehzahl ohne Sprung). OFF = Handdrehzahl. |

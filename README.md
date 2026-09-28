@@ -255,6 +255,13 @@ accepts the usual number options (`name`, `id`, `icon`, `entity_category`,
 
 ### Switches
 
+The *Restore* column says how a switch starts after a restart (power loss,
+OTA update, reset). *default off* and *default on* mean: the switch comes
+back as it was before the restart. Off or on only applies when nothing is
+stored yet, i.e. on the very first boot or after you change its `name`.
+*always off* means: off after every restart. You can change this with the
+usual `restore_mode` option of the switch.
+
 | Key | Default name | Restore | Meaning |
 |---|---|---|---|
 | `control` | VPD control | default off | ON = the controller drives the fan (takes over the current speed without a jump). OFF = manual speed. |
