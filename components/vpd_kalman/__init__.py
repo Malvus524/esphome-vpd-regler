@@ -3,6 +3,12 @@
 Drives one exhaust fan so that the tent reaches a VPD target for day and
 night. All settings are created as number/switch entities, all diagnostics
 are optional sensors. See README.md.
+
+With room_temperature/room_humidity the Kalman controller runs and the
+fallback controller (PI on a log fan scale with limit finder,
+vpd_fallback_core.h) takes over while the room sensor fails. Without them only
+the fallback controller runs. Optional tuning parameters (tuning:) are fixed
+values, or number entities if they get a name.
 """
 
 import hashlib
@@ -58,6 +64,7 @@ CONF_ON_MESSAGE = "on_message"
 CONF_CONTROLLER_OUTPUT = "controller_output"
 CONF_DAY = "day"
 CONF_NIGHT_KEY = "night"
+CONF_TUNING = "tuning"
 
 # key: (default name, icon, unit, min, max, step, initial, entity category)
 NUMBERS = {
@@ -89,12 +96,47 @@ NUMBERS = {
                           ENTITY_CATEGORY_CONFIG),
 }
 
+# Optional tuning parameters (tuning:). Not set = the built-in default, no
+# entity. A plain value (for s/min also a time like "2min") fixes it, a block
+# with name makes it a number entity that can be changed live.
+# key: (default name, icon, unit, min, max, step, default)
+TUNING = {
+    # Switching Kalman <-> fallback when a configured room sensor fails
+    "room_fallback_delay": ("Room sensor fallback delay", "mdi:timer-alert-outline", "min", 0.5, 60, 0.5, 2),
+    "room_return_delay": ("Room sensor return delay", "mdi:timer-check-outline", "min", 0.5, 60, 0.5, 1),
+    # Remembering the fan per light phase (Kalman)
+    "light_memory_after": ("Light phase memory after", "mdi:timer-sand", "min", 0, 240, 1, 20),
+    "light_memory_delay": ("Light phase memory delay", "mdi:history", "min", 0.5, 60, 0.5, 5),
+    # Start
+    "boot_wait_tent": ("Boot wait tent sensor", "mdi:timer-outline", "s", 10, 600, 10, 60),
+    "boot_wait_night": ("Boot wait day/night", "mdi:timer-outline", "s", 10, 1800, 10, 180),
+    # Kalman filter and sensible maximum
+    "sensible_max_rate": ("Sensible maximum rate", "mdi:speedometer-slow", "%/min", 0.1, 100, 0.1, 5),
+    "sensor_noise": ("Kalman sensor noise", "mdi:chart-bell-curve", "kPa", 0.001, 0.1, 0.0001, 0.0063),
+    "load_change_per_hour": ("Kalman load change", "mdi:sprout", "%/h", 1, 200, 1, 10),
+    # Safety
+    "temperature_hysteresis": ("Safety temperature hysteresis", "mdi:thermometer-lines", "K", 0, 5, 0.1, 0.5),
+    "humidity_hysteresis": ("Safety humidity hysteresis", "mdi:water-percent", "%", 0, 20, 0.5, 3),
+    "all_clear_after": ("Safety all clear after", "mdi:bell-check-outline", "min", 1, 1440, 1, 60),
+    # Fallback controller
+    "fallback_time_constant": ("Fallback time constant", "mdi:timer-outline", "min", 0.5, 10, 0.5, 2),
+    "fallback_rate": ("Fallback controller rate", "mdi:speedometer", "%/min", 1, 100, 1, 10),
+    "limit_finder_cost": ("Limit finder fan cost", "mdi:scale-balance", None, 0, 20, 0.1, 4),
+    "limit_finder_step": ("Limit finder test step", "mdi:stairs", "%", 5, 50, 1, 15),
+    "fallback_smoothing": ("Fallback VPD smoothing", "mdi:chart-bell-curve-cumulative", "s", 10, 300, 10, 30),
+    "limit_test_margin": ("Limit test margin", "mdi:plus-minus-variant", "kPa", 0, 0.1, 0.001, 0.01),
+    "limit_test_max_pause": ("Limit test max. pause", "mdi:timer-pause-outline", "min", 5, 480, 5, 60),
+}
+
 # key: (default name, icon, restore mode, entity category)
 SWITCHES = {
     "control": ("VPD control", "mdi:fan-auto", "RESTORE_DEFAULT_OFF", None),
     "tent_open": ("Tent open", "mdi:door-open", "ALWAYS_OFF", None),
     "leaf_sensor": ("Leaf temperature from sensor", "mdi:leaf", "RESTORE_DEFAULT_ON", ENTITY_CATEGORY_CONFIG),
 }
+
+# Optional switch "use fallback controller": only created if configured
+CONF_FORCE_FALLBACK = "force_fallback"
 
 # key: (icon, unit, accuracy, state class, entity category) - all optional
 SENSORS = {
@@ -108,11 +150,28 @@ SENSORS = {
     "moisture_load": ("mdi:sprout", "kPa", 4, STATE_CLASS_MEASUREMENT, ENTITY_CATEGORY_DIAGNOSTIC),
     "next_step_benefit": ("mdi:trending-up", "kPa", 4, STATE_CLASS_MEASUREMENT, ENTITY_CATEGORY_DIAGNOSTIC),
     "vpd_at_max": ("mdi:arrow-collapse-up", "kPa", 3, STATE_CLASS_MEASUREMENT, ENTITY_CATEGORY_DIAGNOSTIC),
+    # Fallback controller
+    "limit_finder_drift": ("mdi:chart-line-variant", "kPa/min", 4, None, ENTITY_CATEGORY_DIAGNOSTIC),
+    "limit_finder_vpd_change": ("mdi:delta", "kPa", 3, None, ENTITY_CATEGORY_DIAGNOSTIC),
+    "limit_finder_cost_before": ("mdi:scale-balance", None, 2, None, ENTITY_CATEGORY_DIAGNOSTIC),
+    "limit_finder_cost_after": ("mdi:scale-balance", None, 2, None, ENTITY_CATEGORY_DIAGNOSTIC),
 }
 
+# Only used by the Kalman controller: not created (numbers) or rejected
+# (sensors, tuning) when no room sensor is configured
+KALMAN_ONLY = {
+    "vpd_sacrifice", "speed",
+    "excess", "excess_target", "moisture_load", "next_step_benefit", "vpd_at_max",
+    "room_fallback_delay", "room_return_delay", "light_memory_after", "light_memory_delay",
+    "sensible_max_rate", "sensor_noise", "load_change_per_hour",
+    CONF_FORCE_FALLBACK,
+}
+
+# key: (device class, icon) - all optional
 BINARY_SENSORS = {
-    "temperature_protection": DEVICE_CLASS_HEAT,
-    "humidity_protection": DEVICE_CLASS_MOISTURE,
+    "temperature_protection": (DEVICE_CLASS_HEAT, None),
+    "humidity_protection": (DEVICE_CLASS_MOISTURE, None),
+    "fallback_active": (None, "mdi:swap-horizontal"),
 }
 
 
@@ -145,12 +204,45 @@ def _switch_schema(key):
 
 def _sensor_schema(key):
     icon, unit, accuracy, state_class, category = SENSORS[key]
-    kwargs = {"icon": icon, "unit_of_measurement": unit, "accuracy_decimals": accuracy}
+    kwargs = {"icon": icon, "accuracy_decimals": accuracy}
+    if unit is not None:
+        kwargs["unit_of_measurement"] = unit
     if state_class is not None:
         kwargs["state_class"] = state_class
     if category is not None:
         kwargs["entity_category"] = category
     return cv.Optional(key), sensor.sensor_schema(**kwargs)
+
+
+def _tuning_schema(key):
+    name, icon, unit, lo, hi, step, default = TUNING[key]
+    kwargs = {"icon": icon, "entity_category": ENTITY_CATEGORY_CONFIG}
+    if unit is not None:
+        kwargs["unit_of_measurement"] = unit
+    entity = number.number_schema(VpdNumber, **kwargs).extend(
+        {
+            cv.Optional(CONF_MIN_VALUE, default=lo): cv.float_,
+            cv.Optional(CONF_MAX_VALUE, default=hi): cv.float_,
+            cv.Optional(CONF_STEP, default=step): cv.positive_float,
+            cv.Optional(CONF_INITIAL_VALUE, default=default): cv.float_,
+            cv.Optional(CONF_MODE, default="BOX"): cv.enum(number.NUMBER_MODES, upper=True),
+        }
+    )
+    in_range = cv.float_range(min=lo, max=hi)
+
+    def validate(value):
+        if isinstance(value, dict):
+            # Entity: the default name unless one is given
+            return entity({CONF_NAME: name, **value})
+        if unit in ("s", "min") and isinstance(value, str):
+            try:
+                value = float(value)
+            except ValueError:
+                ms = cv.positive_time_period_milliseconds(value).total_milliseconds
+                value = ms / (60000.0 if unit == "min" else 1000.0)
+        return in_range(value)
+
+    return cv.Optional(key), validate
 
 
 def _storage_key(name):
@@ -173,14 +265,15 @@ _schema = {
     cv.Required(CONF_TEMPERATURE): cv.use_id(sensor.Sensor),
     cv.Required(CONF_HUMIDITY): cv.use_id(sensor.Sensor),
     cv.Optional(CONF_LEAF_TEMPERATURE): cv.use_id(sensor.Sensor),
-    cv.Required(CONF_ROOM_TEMPERATURE): cv.use_id(sensor.Sensor),
-    cv.Required(CONF_ROOM_HUMIDITY): cv.use_id(sensor.Sensor),
+    cv.Optional(CONF_ROOM_TEMPERATURE): cv.use_id(sensor.Sensor),
+    cv.Optional(CONF_ROOM_HUMIDITY): cv.use_id(sensor.Sensor),
     cv.Optional(CONF_EXTERNAL_CLIMATE): cv.returning_lambda,
     cv.Optional(CONF_LANGUAGE, default="en"): cv.enum(LANGUAGES, lower=True),
     cv.Optional(CONF_AIRFLOW_AT_ZERO, default=0.2): cv.float_range(min=0.0, max=0.95),
     cv.Optional(CONF_TIME_CONSTANT, default="21s"): cv.positive_time_period_milliseconds,
     cv.Optional(CONF_LEAF_MAX_DEVIATION, default=6.0): cv.positive_float,
     cv.Optional(CONF_STORAGE_KEYS, default={}): STORAGE_KEYS_SCHEMA,
+    cv.Optional(CONF_TUNING, default={}): cv.Schema(dict(_tuning_schema(k) for k in TUNING)),
     cv.Optional(CONF_ON_MESSAGE): automation.validate_automation({}),
 }
 for _key in NUMBERS:
@@ -192,15 +285,53 @@ for _key in SWITCHES:
 for _key in SENSORS:
     _k, _v = _sensor_schema(_key)
     _schema[_k] = _v
+_schema[cv.Optional(CONF_FORCE_FALLBACK)] = switch.switch_schema(
+    VpdSwitch,
+    icon="mdi:swap-horizontal",
+    default_restore_mode="RESTORE_DEFAULT_OFF",
+    entity_category=ENTITY_CATEGORY_CONFIG,
+)
 _schema[cv.Optional("state")] = text_sensor.text_sensor_schema(
     icon="mdi:state-machine", entity_category=ENTITY_CATEGORY_DIAGNOSTIC
 )
-for _key, _cls in BINARY_SENSORS.items():
-    _schema[cv.Optional(_key)] = binary_sensor.binary_sensor_schema(
-        device_class=_cls, entity_category=ENTITY_CATEGORY_DIAGNOSTIC
-    )
+for _key, (_cls, _icon) in BINARY_SENSORS.items():
+    _kwargs = {"entity_category": ENTITY_CATEGORY_DIAGNOSTIC}
+    if _cls is not None:
+        _kwargs["device_class"] = _cls
+    if _icon is not None:
+        _kwargs["icon"] = _icon
+    _schema[cv.Optional(_key)] = binary_sensor.binary_sensor_schema(**_kwargs)
 
-CONFIG_SCHEMA = cv.Schema(_schema).extend(cv.COMPONENT_SCHEMA)
+
+def _is_fallback(config):
+    return CONF_ROOM_TEMPERATURE not in config
+
+
+def _check_mode(config):
+    # Without room sensor only the fallback controller runs. Numbers have
+    # defaults and are simply not created, diagnostic sensors and tuning
+    # parameters are only there if the user added them, so they are most
+    # likely a mistake.
+    if not _is_fallback(config):
+        return config
+    for key in [*SENSORS, CONF_FORCE_FALLBACK]:
+        if key in config and key in KALMAN_ONLY:
+            raise cv.Invalid(
+                f"'{key}' needs room_temperature and room_humidity (Kalman controller)", path=[key]
+            )
+    for key in config[CONF_TUNING]:
+        if key in KALMAN_ONLY:
+            raise cv.Invalid(
+                f"'{key}' needs room_temperature and room_humidity (Kalman controller)", path=[CONF_TUNING, key]
+            )
+    return config
+
+
+CONFIG_SCHEMA = cv.All(
+    cv.Schema(_schema).extend(cv.COMPONENT_SCHEMA),
+    cv.has_none_or_all_keys(CONF_ROOM_TEMPERATURE, CONF_ROOM_HUMIDITY),
+    _check_mode,
+)
 
 
 async def to_code(config):
@@ -213,15 +344,20 @@ async def to_code(config):
     cg.add(var.set_humidity(await cg.get_variable(config[CONF_HUMIDITY])))
     if CONF_LEAF_TEMPERATURE in config:
         cg.add(var.set_leaf_temperature(await cg.get_variable(config[CONF_LEAF_TEMPERATURE])))
-    cg.add(var.set_room_temperature(await cg.get_variable(config[CONF_ROOM_TEMPERATURE])))
-    cg.add(var.set_room_humidity(await cg.get_variable(config[CONF_ROOM_HUMIDITY])))
+    fallback = _is_fallback(config)
+    # With room sensor: Kalman controller, fallback while it fails.
+    # Without: fallback controller only (see vpd_controller_core.h)
+    if not fallback:
+        cg.add(var.set_room_temperature(await cg.get_variable(config[CONF_ROOM_TEMPERATURE])))
+        cg.add(var.set_room_humidity(await cg.get_variable(config[CONF_ROOM_HUMIDITY])))
     if CONF_EXTERNAL_CLIMATE in config:
         lam = await cg.process_lambda(config[CONF_EXTERNAL_CLIMATE], [], return_type=ExternalClimate)
         cg.add(var.set_external_climate(lam))
 
     cg.add(var.set_language(config[CONF_LANGUAGE]))
     cg.add(var.set_airflow_at_zero(config[CONF_AIRFLOW_AT_ZERO]))
-    cg.add(var.set_time_constant(config[CONF_TIME_CONSTANT]))
+    if not fallback:
+        cg.add(var.set_time_constant(config[CONF_TIME_CONSTANT]))
     cg.add(var.set_leaf_max_deviation(config[CONF_LEAF_MAX_DEVIATION]))
 
     keys = config[CONF_STORAGE_KEYS]
@@ -234,7 +370,22 @@ async def to_code(config):
         )
     )
 
+    for key, conf in config[CONF_TUNING].items():
+        index = getattr(vpd_kalman_ns, f"TUNING_{key.upper()}")
+        if isinstance(conf, dict):
+            num = await number.new_number(
+                conf, min_value=conf[CONF_MIN_VALUE], max_value=conf[CONF_MAX_VALUE], step=conf[CONF_STEP]
+            )
+            await cg.register_component(num, conf)
+            cg.add(num.set_initial_value(conf[CONF_INITIAL_VALUE]))
+            cg.add(var.set_tuning_number(index, num))
+        else:
+            cg.add(var.set_tuning(index, conf))
+
+    skip = KALMAN_ONLY if fallback else set()
     for key in NUMBERS:
+        if key in skip:
+            continue
         conf = config[key]
         num = await number.new_number(
             conf, min_value=conf[CONF_MIN_VALUE], max_value=conf[CONF_MAX_VALUE], step=conf[CONF_STEP]
@@ -244,10 +395,17 @@ async def to_code(config):
         cg.add(getattr(var, f"set_{key}_number")(num))
 
     for key in SWITCHES:
+        if key in skip:
+            continue
         conf = config[key]
         sw = await switch.new_switch(conf)
         await cg.register_component(sw, conf)
         cg.add(getattr(var, f"set_{key}_switch")(sw))
+
+    if conf := config.get(CONF_FORCE_FALLBACK):
+        sw = await switch.new_switch(conf)
+        await cg.register_component(sw, conf)
+        cg.add(var.set_force_fallback_switch(sw))
 
     for key in SENSORS:
         if conf := config.get(key):

@@ -12,7 +12,7 @@
 #include "esphome/components/switch/switch.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 
-#include "vpd_kalman_core.h"
+#include "vpd_controller_core.h"
 
 namespace esphome {
 namespace vpd_kalman {
@@ -44,7 +44,10 @@ class VpdSwitch : public switch_::Switch, public Component {
 
 class VpdKalman : public PollingComponent {
  public:
-  VpdKalman() : PollingComponent(10000) {}
+  VpdKalman() : PollingComponent(10000) {
+    for (float &v : this->tuning_value_)
+      v = NAN;
+  }
 
   void setup() override;
   void update() override;
@@ -59,13 +62,23 @@ class VpdKalman : public PollingComponent {
   void set_temperature(sensor::Sensor *s) { this->temperature_ = s; }
   void set_humidity(sensor::Sensor *s) { this->humidity_ = s; }
   void set_leaf_temperature(sensor::Sensor *s) { this->leaf_temperature_ = s; }
-  void set_room_temperature(sensor::Sensor *s) { this->room_temperature_ = s; }
-  void set_room_humidity(sensor::Sensor *s) { this->room_humidity_ = s; }
+  // Both room sensors set = Kalman controller with fallback, none = fallback only
+  void set_room_temperature(sensor::Sensor *s) {
+    this->room_temperature_ = s;
+    this->core_.set_room_configured(this->room_temperature_ != nullptr && this->room_humidity_ != nullptr);
+  }
+  void set_room_humidity(sensor::Sensor *s) {
+    this->room_humidity_ = s;
+    this->core_.set_room_configured(this->room_temperature_ != nullptr && this->room_humidity_ != nullptr);
+  }
   void set_external_climate(std::function<ExternalClimate()> &&f) { this->external_climate_ = f; }
   void set_language(Language lang) { this->core_.set_language(lang); }
   void set_airflow_at_zero(float q0) { this->core_.set_airflow_at_zero(q0); }
-  void set_time_constant(uint32_t ms) { this->core_.set_time_constant_s(ms / 1000.0f); }
+  void set_time_constant(uint32_t ms) { this->core_.kalman.set_time_constant_s(ms / 1000.0f); }
   void set_leaf_max_deviation(float d) { this->core_.set_leaf_max_deviation(d); }
+  // Tuning parameter as fixed value or as number entity
+  void set_tuning(TuningKey key, float value) { this->tuning_value_[key] = value; }
+  void set_tuning_number(TuningKey key, VpdNumber *n) { this->tuning_number_[key] = n; }
   void set_storage_keys(uint32_t output, uint32_t day, uint32_t night) {
     this->key_u_ = output;
     this->key_day_ = day;
@@ -95,6 +108,7 @@ class VpdKalman : public PollingComponent {
   void set_control_switch(VpdSwitch *s);
   void set_tent_open_switch(VpdSwitch *s) { this->tent_open_ = s; }
   void set_leaf_sensor_switch(VpdSwitch *s) { this->leaf_switch_ = s; }
+  void set_force_fallback_switch(VpdSwitch *s) { this->force_fallback_ = s; }
 
   // Diagnostics (all optional)
   void set_control_vpd_sensor(sensor::Sensor *s) { this->s_control_vpd_ = s; }
@@ -107,23 +121,31 @@ class VpdKalman : public PollingComponent {
   void set_moisture_load_sensor(sensor::Sensor *s) { this->s_moisture_load_ = s; }
   void set_next_step_benefit_sensor(sensor::Sensor *s) { this->s_next_step_benefit_ = s; }
   void set_vpd_at_max_sensor(sensor::Sensor *s) { this->s_vpd_at_max_ = s; }
+  void set_limit_finder_drift_sensor(sensor::Sensor *s) { this->s_limit_finder_drift_ = s; }
+  void set_limit_finder_vpd_change_sensor(sensor::Sensor *s) { this->s_limit_finder_vpd_change_ = s; }
+  void set_limit_finder_cost_before_sensor(sensor::Sensor *s) { this->s_limit_finder_cost_before_ = s; }
+  void set_limit_finder_cost_after_sensor(sensor::Sensor *s) { this->s_limit_finder_cost_after_ = s; }
   void set_state_text_sensor(text_sensor::TextSensor *s) { this->t_state_ = s; }
   void set_temperature_protection_binary_sensor(binary_sensor::BinarySensor *s) { this->b_temp_prot_ = s; }
   void set_humidity_protection_binary_sensor(binary_sensor::BinarySensor *s) { this->b_rh_prot_ = s; }
+  void set_fallback_active_binary_sensor(binary_sensor::BinarySensor *s) { this->b_fallback_ = s; }
 
   template<typename F> void add_on_message_callback(F &&callback) {
     this->message_callback_.add(std::forward<F>(callback));
   }
 
   /// Level currently applied to the fan output in %.
-  float get_fan_level() const { return this->core_.fan_level; }
+  float get_fan_level() const { return this->core_.active().fan_level; }
+  /// True while the fallback controller without room sensor drives the fan.
+  bool is_fallback_active() const { return this->core_.fallback_active(); }
 
  protected:
   void apply_level_(float level);
+  static void publish_binary_(binary_sensor::BinarySensor *b, bool state);
   static float state_of_(number::Number *n) { return n == nullptr ? NAN : n->state; }
   static float state_of_(sensor::Sensor *s) { return s == nullptr ? NAN : s->state; }
 
-  VpdKalmanCore core_;
+  VpdControllerCore core_;
   Inputs in_;
   Outputs out_;
 
@@ -137,13 +159,17 @@ class VpdKalman : public PollingComponent {
       *sacrifice_{nullptr}, *speed_{nullptr}, *transition_{nullptr}, *open_max_{nullptr}, *fan_min_{nullptr},
       *fan_max_{nullptr}, *emergency_{nullptr}, *temp_max_{nullptr}, *temp_band_{nullptr}, *rh_max_{nullptr},
       *rh_band_{nullptr}, *leaf_offset_day_{nullptr}, *leaf_offset_night_{nullptr};
-  VpdSwitch *control_{nullptr}, *tent_open_{nullptr}, *leaf_switch_{nullptr};
+  float tuning_value_[TUNING_COUNT];         // NAN = not configured
+  VpdNumber *tuning_number_[TUNING_COUNT] = {};
+  VpdSwitch *control_{nullptr}, *tent_open_{nullptr}, *leaf_switch_{nullptr}, *force_fallback_{nullptr};
 
   sensor::Sensor *s_control_vpd_{nullptr}, *s_target_active_{nullptr}, *s_controller_output_{nullptr},
       *s_sensible_max_{nullptr}, *s_fan_output_{nullptr}, *s_excess_{nullptr}, *s_excess_target_{nullptr},
       *s_moisture_load_{nullptr}, *s_next_step_benefit_{nullptr}, *s_vpd_at_max_{nullptr};
+  sensor::Sensor *s_limit_finder_drift_{nullptr}, *s_limit_finder_vpd_change_{nullptr},
+      *s_limit_finder_cost_before_{nullptr}, *s_limit_finder_cost_after_{nullptr};
   text_sensor::TextSensor *t_state_{nullptr};
-  binary_sensor::BinarySensor *b_temp_prot_{nullptr}, *b_rh_prot_{nullptr};
+  binary_sensor::BinarySensor *b_temp_prot_{nullptr}, *b_rh_prot_{nullptr}, *b_fallback_{nullptr};
 
   CallbackManager<void(std::string, std::string)> message_callback_;
 

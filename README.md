@@ -10,6 +10,34 @@
 > and do not leave it unsupervised where a wrong fan setting could harm your
 > plants or equipment. It comes without any warranty (see [LICENSE](LICENSE)).
 
+## Why a dedicated VPD controller?
+
+VPD decides how much water the plants evaporate: too low and they barely
+transpire, take up few nutrients and invite mould, too high and they close
+their stomata. In a tent the exhaust fan is usually the only thing that moves
+it, so the fan controller decides how close you get to the target, and how
+much electricity and noise that costs.
+
+A normal PID controller on "VPD -> fan" works on paper, but a grow tent
+breaks several of its assumptions:
+
+| Problem in the tent | What a PID does | What this controller does |
+|---|---|---|
+| **The fan acts very unevenly.** The humidity excess falls with `1 / airflow`: 10 -> 20 % fan changes a lot, 80 -> 90 % hardly anything. The tent also reacts much more slowly at low fan (`tau / airflow`). | Fixed gains fit only one operating point: too aggressive at low speed (oscillates), too sluggish at high speed. | Works on a logarithmic airflow scale with a gain that follows the airflow (`k = speed * q / tau`), so it behaves the same at every speed. |
+| **The target is often unreachable**, e.g. when the room air is humid or the plants transpire a lot. | The integral winds up and the fan runs at 100 % for hours, for a few hundredths of a kPa. | Estimates the moisture load and stops at the **sensible maximum**, where more fan would gain less VPD than you are willing to give up. Saves a lot of energy, especially in winter. |
+| **The room air enters 1:1.** Every change in the room shows up in the tent. | Only notices it once the VPD has already moved, then over- or undershoots. | Measures the room air and works with the vapour pressure excess `tent - room`, so room changes do not look like controller errors. |
+| **Light changes are big, predictable jumps** in temperature and transpiration. | Chases the jump from the old fan speed, overshoots and needs a long time to settle. | Jumps straight to the fan speed it remembered for this light phase and moves the target smoothly (*setpoint transition*) instead of fighting a gap that closes on its own. |
+| **Noisy sensors.** | The derivative term amplifies the noise, so it is often switched off. | A Kalman filter separates sensor noise from real load changes and limits outliers. |
+| **Tent open, sensor failures.** | Winds up on meaningless readings. | Holds the fan while the tent is open, falls back to a controller without room sensor while the room sensor fails, runs an emergency speed if the tent sensor fails. |
+| **Too hot or too humid.** | Has only one goal. | A separate safety layer overrides the controller above temperature and humidity limits and reports it. |
+
+In short: a PID only reacts to the deviation. This controller also knows
+*why* the VPD deviates (room air, plant load, light phase) and whether more
+fan would actually help. That is what gets the VPD close to the target
+without running the fan at full speed for nothing.
+
+## What it is
+
 An [ESPHome](https://esphome.io) external component that controls the
 **VPD (vapour pressure deficit)** of a grow tent with a single exhaust fan.
 
@@ -25,8 +53,13 @@ An [ESPHome](https://esphome.io) external component that controls the
 - **Tent open** switch that pauses the controller while you work in the tent
 - Leaf temperature from an IR sensor (e.g. MLX90614) or a fixed day/night offset
 - Optional second tent sensor (e.g. over ESP-NOW) via a lambda
+- **Fallback controller** that only needs the tent sensor: it takes over
+  automatically while the room sensor fails, or runs alone if you have no
+  room sensor, see [Fallback controller](#fallback-controller)
 - Every setting is a Home Assistant entity, every internal value can be
   exposed as a diagnostic sensor
+- Optional [tuning parameters](#tuning-parameters-optional) for other setups,
+  as fixed values or as entities, only if you add them
 - State texts and notifications in English or German
 
 The fan is the only thing it drives. Humidifiers, heaters or lamp dimming
@@ -108,18 +141,19 @@ the fan. A complete example with sensors, diagnostics and notifications is in
 | `night` | yes | Binary sensor, ON = night (lights off). Day/night selects the target, the leaf offset and the remembered fan speed. Until it has a state after boot, the controller holds the fan (max. 3 min). |
 | `temperature`, `humidity` | yes | Tent air sensor. |
 | `leaf_temperature` | no | Leaf temperature sensor (IR). Used while the switch *Leaf temperature from sensor* is on and the value is within `leaf_max_deviation` of the air temperature. Otherwise air temperature + leaf offset day/night. |
-| `room_temperature`, `room_humidity` | yes | Air the fan draws in. Without it the controller holds the fan. |
+| `room_temperature`, `room_humidity` | no | Air the fan draws in. Both or none. With them the Kalman controller runs, and the [fallback controller](#fallback-controller) takes over while they fail. Without them only the fallback controller runs. |
 | `external_climate` | no | Lambda returning `vpd_kalman::ExternalClimate` with `temperature`, `humidity`, `leaf_temperature` (and `selected` for the log). If all three are valid, they are used instead of the own sensors, e.g. for a second sensor at canopy height. See below. |
 
 ### Options
 
 | Key | Default | Description |
 |---|---|---|
-| `airflow_at_zero` | `0.2` | Airflow of the fan at 0 % relative to 100 % (`q0`). Enters the moisture load and the sensible maximum. |
-| `time_constant` | `21s` | Time the tent needs at 100 % fan until 63 % of a humidity change is exhausted (`tau`). Sets the filter dynamics and, together with *Controller speed*, how fast the controller acts. |
+| `airflow_at_zero` | `0.2` | Airflow of the fan at 0 % relative to 100 % (`q0`). Enters the moisture load and the sensible maximum. The fallback controller uses it for its log fan scale. |
+| `time_constant` | `21s` | Time the tent needs at 100 % fan until 63 % of a humidity change is exhausted (`tau`). Sets the filter dynamics and, together with *Controller speed*, how fast the controller acts. Kalman controller only. |
 | `leaf_max_deviation` | `6.0` | Leaf sensor values further than this (°C) from the air temperature count as measurement errors. |
 | `language` | `en` | `en` or `de`: state texts, notifications and log lines. |
 | `storage_keys` | - | Only for migrating from a `globals:` setup, see below. |
+| `tuning` | - | Optional tuning parameters, see [below](#tuning-parameters-optional). |
 | `on_message` | - | Automation with `title` and `message` (`std::string`) for notifications. |
 
 The controller runs every 10 s. This is fixed, because the filter and the
@@ -156,8 +190,9 @@ accepts the usual number options (`name`, `id`, `icon`, `entity_category`,
 | Key | Default name | Restore | Meaning |
 |---|---|---|---|
 | `control` | VPD control | default off | ON = the controller drives the fan (takes over the current speed without a jump). OFF = manual speed. |
-| `tent_open` | Tent open | always off | Holds the fan, pauses filter and remembering, safety stays active. |
+| `tent_open` | Tent open | always off | Holds the fan, pauses filter, remembering and limit finder, safety stays active. |
 | `leaf_sensor` | Leaf temperature from sensor | default on | Use `leaf_temperature` instead of the offsets. |
+| `force_fallback` | - (optional, only with `name`) | default off | ON = the [fallback controller](#fallback-controller) runs although the room sensor works, e.g. to compare both controllers. Only with room sensor. |
 
 ### Diagnostics (optional)
 
@@ -179,8 +214,124 @@ usual sensor options.
 | `state` | text | E.g. *In band*, *Regulating*, *At sensible maximum*, *Target unreachable*, *Safety (temperature)*, *Tent open - paused (5 min)*. |
 | `temperature_protection` | binary | ON while the temperature safety raises the fan. |
 | `humidity_protection` | binary | ON while the humidity safety raises the fan. |
+| `fallback_active` | binary | ON while the fallback controller drives the fan. |
+| `limit_finder_drift` | kPa/min | Fallback: VPD drift measured before the last test step. |
+| `limit_finder_vpd_change` | kPa | Fallback: effect of the last test step, without the drift. |
+| `limit_finder_cost_before` | - | Fallback: `J` before the last test step. |
+| `limit_finder_cost_after` | - | Fallback: `J` after the last test step (with margin). |
 
 ---
+
+## Fallback controller
+
+The Kalman controller needs the room air. For the case that it is missing,
+the component contains a second, simpler controller that only needs the tent
+sensor. It is always part of the firmware:
+
+- **Room sensor configured:** the Kalman controller runs. If the room sensor
+  has no valid value for 2 min, the fallback controller takes over. After
+  1 min of valid values again, the Kalman controller takes over again. Both
+  switches send a notification (`on_message`), the state text gets
+  *(no room sensor)* while the fallback runs. Shorter dropouts only hold the
+  fan.
+- **Switch `force_fallback` (optional):** ON hands over to the fallback
+  controller right away, the room sensor keeps recording, so both
+  controllers can be compared on the same data. OFF hands back right away
+  (after the return delay if the room sensor is missing just then). No
+  notification, the state text gets *(fallback)*.
+
+  ```yaml
+  vpd_kalman:
+    # ...
+    force_fallback:
+      name: "Use fallback controller"
+  ```
+- **No room sensor configured:** only the fallback controller runs.
+
+  ```yaml
+  vpd_kalman:
+    output: fan_pwm
+    night: lights_off
+    temperature: tent_temperature
+    humidity: tent_humidity
+  ```
+
+On a switch the fan is taken over without a jump, safety episodes, *Tent
+open* and the remembered events carry on. The fallback starts its upper
+limit at the last sensible maximum of the Kalman controller. Back in the
+Kalman controller, the filter is re-synchronised to the measurement and keeps
+the estimated load.
+
+Without the room air the fallback cannot estimate the moisture load. It
+works in three levels, every 10 s:
+
+1. **Base controller**: a PI controller on a log fan scale,
+   `x = ln(u + u0)` with `u0 = 100 * q0 / (1 - q0)` from `airflow_at_zero`.
+   Equal steps in `x` are equal relative airflow changes. Nothing happens
+   inside the deadband.
+2. **Limit finder**: if the VPD stays below the band while the fan sits at
+   its upper limit for 3 time constants, it tries out whether a lower (or
+   higher) limit is better. It measures the VPD drift, moves the limit by one
+   test step, waits 3 time constants and compares
+   `J = (deviation / 0.1 kPa)^2 + fan cost * (fan / 100 %)^2` before and
+   after, with the drift taken out. The step is kept if `J` gets clearly
+   smaller (margin 0.01 kPa), otherwise the limit goes back and the next test
+   waits twice as long (max. 60 min). This is the fallback's version of the
+   sensible maximum. The limit is reset to *Fan maximum automatic* after a
+   light change, a target change, a tent sensor change and when the control
+   is switched on.
+3. **Safety**: the same as in the Kalman controller.
+
+The controlled VPD is the mean of the last 30 s. *Tent open*, the
+*setpoint transition* (after light changes, closing the tent and a tent
+sensor change), manual mode, notifications, leaf temperature and
+`external_climate` work as in the Kalman controller. Its settings (time
+constant, rate, fan cost, test step) are [tuning parameters](#tuning-parameters-optional).
+
+Without room sensor the settings *Allowed VPD sacrifice* and *Controller
+speed* are not created and `time_constant` is ignored. The Kalman-only
+diagnostics (`excess`, `excess_target`, `moisture_load`,
+`next_step_benefit`, `vpd_at_max`) and tuning parameters are rejected.
+
+## Tuning parameters (optional)
+
+For setups that differ from the defaults. Leave a parameter out and the
+built-in default applies, no entity is created. A plain value fixes it (for
+times also `90s`, `2min`), a block with `name` turns it into a number entity
+under *Configuration* that you can change live (it accepts the usual number
+options, `initial_value` defaults to the default):
+
+```yaml
+vpd_kalman:
+  # ...
+  tuning:
+    room_fallback_delay: 5min          # fixed
+    sensor_noise: 0.01                 # fixed
+    fallback_rate:                     # entity
+      name: "Fallback controller rate"
+```
+
+| Key | Unit | Default | Range | Controller | Meaning |
+|---|---|---|---|---|---|
+| `room_fallback_delay` | min | 2 | 0.5-60 | switch | How long the room sensor may be missing before the fallback takes over. |
+| `room_return_delay` | min | 1 | 0.5-60 | switch | How long the room sensor must deliver again before the Kalman controller is back. |
+| `light_memory_after` | min | 20 | 0-240 | Kalman | Time after a light change before the fan of this light phase is remembered. |
+| `light_memory_delay` | min | 5 | 0.5-60 | Kalman | The value remembered is the one from this long ago, so the late end of a light phase does not spoil it. |
+| `boot_wait_tent` | s | 60 | 10-600 | both | After boot, hold the fan this long while no tent value has arrived. |
+| `boot_wait_night` | s | 180 | 10-1800 | both | After boot, hold the fan this long while day/night is unknown. |
+| `sensible_max_rate` | %/min | 5 | 0.1-100 | Kalman | How fast the sensible maximum may change. |
+| `sensor_noise` | kPa | 0.0063 | 0.001-0.1 | Kalman | Measurement noise of the vapour pressure excess. Higher = the filter trusts single readings less. |
+| `load_change_per_hour` | %/h | 10 | 1-200 | Kalman | How fast the moisture load may change. Higher = the load estimate follows faster but noisier. |
+| `temperature_hysteresis` | K | 0.5 | 0-5 | both | The temperature safety switches off only this far below its limit. |
+| `humidity_hysteresis` | % | 3 | 0-20 | both | The same for the humidity safety. |
+| `all_clear_after` | min | 60 | 1-1440 | both | A safety episode ends (all clear notification) after this long without triggering. |
+| `fallback_time_constant` | min | 2 | 0.5-10 | fallback | How fast the VPD reacts to a fan change. Sets the P part and all limit finder times (3 time constants each). |
+| `fallback_rate` | %/min | 10 | 1-100 | fallback | Relative fan change per minute at 0.1 kPa outside the deadband. |
+| `limit_finder_cost` | - | 4 | 0-20 | fallback | Weight of the fan in `J`. Higher = the limit is lowered more readily. |
+| `limit_finder_step` | % | 15 | 5-50 | fallback | Size of one test step, relative to the airflow. |
+| `fallback_smoothing` | s | 30 | 10-300 | fallback | Averaging time of the controlled VPD. |
+| `limit_test_margin` | kPa | 0.01 | 0-0.1 | fallback | How clearly a test step has to be better to be kept. |
+| `limit_test_max_pause` | min | 60 | 5-480 | fallback | Longest waiting time between two tests after discarded steps. |
 
 ## Notifications
 

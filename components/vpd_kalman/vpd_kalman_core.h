@@ -58,6 +58,14 @@
 // Note: the code of step() is intentionally kept 1:1 with the original
 // YAML lambda it was extracted from (German variable names included), so
 // that equivalence can be verified bit by bit.
+//
+// Without room sensor VpdFallbackCore (vpd_fallback_core.h) runs instead,
+// VpdControllerCore (vpd_controller_core.h) switches between the two. Both
+// derive from CoreBase, which holds everything that is handed over on a
+// switch (fan level, stored values, event memory, safety episodes).
+//
+// Tuning parameters (struct Tuning) replace constants of step(). NAN = not
+// configured, then the original constant is used unchanged.
 // ==================================================================
 
 #include <algorithm>
@@ -128,6 +136,76 @@ struct ExternalClimate {
   float leaf_temperature{NAN};
 };
 
+// Optional tuning parameters, in the unit of their entity. NAN = default.
+struct Tuning {
+  // Switching Kalman <-> fallback when a configured room sensor fails
+  float room_fallback_delay{NAN};    // min without room value until the fallback takes over
+  float room_return_delay{NAN};      // min with valid room values until the Kalman controller is back
+  // Remembering the fan per light phase (Kalman)
+  float light_memory_after{NAN};     // min after a light change before remembering starts
+  float light_memory_delay{NAN};     // min delay of the remembered value
+  // Start
+  float boot_wait_tent{NAN};         // s holding the fan until the first tent value
+  float boot_wait_night{NAN};        // s holding the fan until day/night is known
+  // Kalman filter and sensible maximum
+  float sensible_max_rate{NAN};      // %/min
+  float sensor_noise{NAN};           // kPa, standard deviation of the measured excess
+  float load_change_per_hour{NAN};   // %/h
+  // Safety
+  float temperature_hysteresis{NAN}; // K
+  float humidity_hysteresis{NAN};    // %RH
+  float all_clear_after{NAN};        // min without triggering until the all clear
+  // Fallback controller
+  float fallback_time_constant{NAN}; // min
+  float fallback_rate{NAN};          // %/min
+  float limit_finder_cost{NAN};
+  float limit_finder_step{NAN};      // %
+  float fallback_smoothing{NAN};     // s
+  float limit_test_margin{NAN};      // kPa
+  float limit_test_max_pause{NAN};   // min
+};
+
+enum TuningKey : uint8_t {
+  TUNING_ROOM_FALLBACK_DELAY,
+  TUNING_ROOM_RETURN_DELAY,
+  TUNING_LIGHT_MEMORY_AFTER,
+  TUNING_LIGHT_MEMORY_DELAY,
+  TUNING_BOOT_WAIT_TENT,
+  TUNING_BOOT_WAIT_NIGHT,
+  TUNING_SENSIBLE_MAX_RATE,
+  TUNING_SENSOR_NOISE,
+  TUNING_LOAD_CHANGE_PER_HOUR,
+  TUNING_TEMPERATURE_HYSTERESIS,
+  TUNING_HUMIDITY_HYSTERESIS,
+  TUNING_ALL_CLEAR_AFTER,
+  TUNING_FALLBACK_TIME_CONSTANT,
+  TUNING_FALLBACK_RATE,
+  TUNING_LIMIT_FINDER_COST,
+  TUNING_LIMIT_FINDER_STEP,
+  TUNING_FALLBACK_SMOOTHING,
+  TUNING_LIMIT_TEST_MARGIN,
+  TUNING_LIMIT_TEST_MAX_PAUSE,
+  TUNING_COUNT,
+};
+
+// Field of each TuningKey
+static float Tuning::*const TUNING_FIELDS[TUNING_COUNT] = {
+    &Tuning::room_fallback_delay,    &Tuning::room_return_delay,      &Tuning::light_memory_after,
+    &Tuning::light_memory_delay,     &Tuning::boot_wait_tent,         &Tuning::boot_wait_night,
+    &Tuning::sensible_max_rate,      &Tuning::sensor_noise,           &Tuning::load_change_per_hour,
+    &Tuning::temperature_hysteresis, &Tuning::humidity_hysteresis,    &Tuning::all_clear_after,
+    &Tuning::fallback_time_constant, &Tuning::fallback_rate,          &Tuning::limit_finder_cost,
+    &Tuning::limit_finder_step,      &Tuning::fallback_smoothing,     &Tuning::limit_test_margin,
+    &Tuning::limit_test_max_pause,
+};
+
+// Tuning value or default
+inline float tuning_or(float v, float def) { return std::isnan(v) ? def : v; }
+// Tuning value converted to ticks (ticks_per_unit), at least lo, or default
+inline int tuning_ticks(float v, float ticks_per_unit, int def, int lo = 1) {
+  return std::isnan(v) ? def : std::max(lo, (int) lroundf(v * ticks_per_unit));
+}
+
 struct Inputs {
   // Night phase (binary sensor, ON = night)
   bool night_has_state{false};
@@ -142,11 +220,13 @@ struct Inputs {
   // Switches
   bool auto_on{false};
   bool tent_open{false};
+  bool force_fallback{false};   // switch "use fallback controller" (VpdControllerCore)
   // Settings (number entities)
   float manual_speed{NAN};
   float target_day{NAN}, target_night{NAN}, deadband{NAN}, sacrifice{NAN}, speed{NAN}, transition{NAN},
       open_max{NAN}, fan_min{NAN}, fan_max{NAN}, emergency{NAN}, temp_max{NAN}, temp_band{NAN}, rh_max{NAN},
       rh_band{NAN}, leaf_offset_day{NAN}, leaf_offset_night{NAN};
+  Tuning tuning;
   uint32_t now_ms{0};
 };
 
@@ -164,19 +244,17 @@ struct Outputs {
   // Diagnostics, published every tick (NAN = unknown)
   float control_vpd{NAN}, target_active{NAN}, controller_output{NAN}, sensible_max{NAN}, fan_output{NAN},
       excess{NAN}, excess_target{NAN}, moisture_load{NAN}, next_step_benefit{NAN}, vpd_at_max{NAN};
+  // Fallback controller only
+  float limit_finder_drift{NAN}, limit_finder_vpd_change{NAN}, limit_finder_cost_before{NAN},
+      limit_finder_cost_after{NAN};
+  bool fallback_active{false};
 };
 
-class VpdKalmanCore {
+// State shared by the Kalman controller and the fallback controller
+// (vpd_fallback_core.h). On a switch it is copied to the controller that
+// takes over, so the fan, remembered events and safety episodes carry on.
+class CoreBase {
  public:
-  // ---------- Configuration ----------
-  void set_language(Language lang) {
-    this->lang_ = lang;
-    this->grund = TEXTS[lang].r_restart;
-  }
-  void set_airflow_at_zero(float q0) { this->q0_ = q0; }
-  void set_time_constant_s(float s) { this->tau_s_ = s; }
-  void set_leaf_max_deviation(float d) { this->leaf_max_dev_ = d; }
-
   // ---------- Persistent values (loaded/saved by the caller) ----------
   float saved_u{30.0f};       // controller output in automatic
   float saved_u_day{-1.0f};   // remembered fan for the day phase
@@ -212,6 +290,62 @@ class VpdKalmanCore {
     return level;
   }
 
+ protected:
+  // ---------- Event memory (was "static" in the lambdas) ----------
+  bool auto_vorher = false, nacht_vorher = false;
+  bool nacht_bekannt = false;       // Nachtphase hat schon einen Wert
+  bool zelt_je_ok = false;          // seit dem Booten schon ein gueltiger Zeltwert
+  int t_boot = 0;                   // Takte seit dem Booten (zaehlt bis BOOT_WARTEN(_NACHT))
+  int quelle_vorher = -1;           // Zeltsensor im letzten Takt: 1 extern, 0 eigener, -1 noch keiner
+  bool offen_vorher = false;        // Schalter "Zelt offen" im letzten Takt
+  int t_offen = 0;                  // Takte seit "Zelt offen"
+  bool sich_t = false, sich_rh = false;   // Sicherheitsstufe aktiv (Hysterese)
+  // Schutz-Episoden, [0] Temperatur, [1] Feuchte
+  bool schutz_vorher[2] = {false, false}, ep[2] = {false, false};
+  int ep_runden[2] = {0, 0}, ep_ruhe[2] = {0, 0};
+  uint32_t ep_start[2] = {0, 0}, ep_ende[2] = {0, 0};
+  float ep_max[2] = {NAN, NAN};
+};
+
+class VpdKalmanCore : public CoreBase {
+ public:
+  // ---------- Configuration ----------
+  void set_language(Language lang) {
+    this->lang_ = lang;
+    this->grund = TEXTS[lang].r_restart;
+  }
+  void set_airflow_at_zero(float q0) { this->q0_ = q0; }
+  void set_time_constant_s(float s) { this->tau_s_ = s; }
+  void set_leaf_max_deviation(float d) { this->leaf_max_dev_ = d; }
+
+  /// Current sensible maximum in % (NAN = not known yet).
+  float sensible_max() const { return this->u_max_s; }
+
+  // ---------- Taking over from the fallback controller ----------
+  // Called right before step(), after CoreBase was copied from the
+  // fallback. Takes over the fan without a jump and re-synchronises the
+  // filter like after "tent open": E to the measurement, the load stays with
+  // more uncertainty. light_changed: there was a light change meanwhile, so
+  // remembering starts over.
+  void take_over(const Inputs &in, bool light_changed, const std::string &reason) {
+    auto par = [](float v, float def) { return std::isnan(v) ? def : v; };
+    float u_min = par(in.fan_min, 5.0f);
+    float u_max = std::max(par(in.fan_max, 100.0f), u_min);
+    if (!gestartet) {
+      gestartet = true;
+      u_phase[0] = this->saved_u_day;
+      u_phase[1] = this->saved_u_night;
+    }
+    u = std::min(std::max(this->fan_level, u_min), u_max);
+    if (!std::isnan(u_max_s)) u_max_s = std::max(u_max_s, u);
+    if (light_changed) t_phase = 0;
+    u_kand = -1.0f; t_kand = 0;
+    kalman_neu = true; e_neu = false;
+    ziel_eff = NAN; fuehr_starten = false;
+    zustand_vorher.clear();
+    grund = reason;
+  }
+
   // ---------- One control tick (10 s) ----------
   void step(const Inputs &in, Outputs &out) {
     const Texts &tx = TEXTS[this->lang_];
@@ -222,20 +356,24 @@ class VpdKalmanCore {
     const float SCHRITT = 1.15f;             // Luefterschritt: +15 % Luftstrom
     const float E_KLEIN = 0.005f;            // kleinster Ueberschuss fuer ln(), kPa
     const float F_MAX = 1.0f;                // Obergrenze fuer |ln(E / Bandrand)|
-    const int PHASE_MERKEN = 120;            // Takte (20 min) bis zum Merken je Lichtphase
-    const int MERK_TAKTE = 30;               // Takte (5 min) Verzoegerung beim Merken
-    const int BOOT_WARTEN = 6;               // Takte (60 s) Ausgang halten bis zum ersten Zeltwert
-    const int BOOT_WARTEN_NACHT = 18;        // Takte (3 min) Ausgang halten bis Tag/Nacht bekannt
-    const float MAX_RATE = 5.0f;             // Aenderung des sinnvollen Maximums, %/min
-    const float R_MESS = 4.0e-5f;            // Messrauschen von E, kPa^2 (~0,006 kPa)
+    const Tuning &tn = in.tuning;            // Einstellparameter, NAN = Standard
+    const int PHASE_MERKEN = tuning_ticks(tn.light_memory_after, 6.0f, 120, 0);  // Takte (20 min) bis zum Merken je Lichtphase
+    const int MERK_TAKTE = tuning_ticks(tn.light_memory_delay, 6.0f, 30);        // Takte (5 min) Verzoegerung beim Merken
+    const int BOOT_WARTEN = tuning_ticks(tn.boot_wait_tent, 0.1f, 6);            // Takte (60 s) Ausgang halten bis zum ersten Zeltwert
+    const int BOOT_WARTEN_NACHT = tuning_ticks(tn.boot_wait_night, 0.1f, 18);    // Takte (3 min) Ausgang halten bis Tag/Nacht bekannt
+    const int BOOT_ZAEHLEN = std::max(BOOT_WARTEN, BOOT_WARTEN_NACHT);
+    const float MAX_RATE = tuning_or(tn.sensible_max_rate, 5.0f);   // Aenderung des sinnvollen Maximums, %/min
+    const float R_MESS = std::isnan(tn.sensor_noise) ? 4.0e-5f       // Messrauschen von E, kPa^2 (~0,006 kPa)
+                                                     : tn.sensor_noise * tn.sensor_noise;
     const float Q_E = 1.0e-5f;               // Modellfehler der Dynamik je Takt, kPa^2 (~0,003 kPa)
-    const float L_REL_H = 0.10f;             // Last darf sich ~10 % pro Stunde aendern
+    const float L_REL_H = std::isnan(tn.load_change_per_hour) ? 0.10f   // Last darf sich ~10 % pro Stunde aendern
+                                                              : tn.load_change_per_hour / 100.0f;
     const float L_TYP = 0.03f;               // Untergrenze fuer das Lastrauschen, kPa
     const float L_MIN = 0.001f;              // kleinste Last, kPa
     const float NIS_MAX = 16.0f;             // Ausreisser ab 4 Sigma
-    const float T_HYST = 0.5f;               // Hysterese Sicherheit Temperatur, K
-    const float RH_HYST = 3.0f;              // Hysterese Sicherheit Feuchte, %rF
-    const int SCHUTZ_RUHE = 360;             // Takte (60 min) ohne Ausloesung = Episode vorbei
+    const float T_HYST = tuning_or(tn.temperature_hysteresis, 0.5f);   // Hysterese Sicherheit Temperatur, K
+    const float RH_HYST = tuning_or(tn.humidity_hysteresis, 3.0f);     // Hysterese Sicherheit Feuchte, %rF
+    const int SCHUTZ_RUHE = tuning_ticks(tn.all_clear_after, 6.0f, 360);   // Takte (60 min) ohne Ausloesung = Episode vorbei
     const float q0 = this->q0_;                        // Luftstrom bei 0 %
     const float tau_voll = this->tau_s_ / 60.0f;       // min, Zeitkonstante bei 100 %
 
@@ -296,7 +434,7 @@ class VpdKalmanCore {
     bool auto_an = in.auto_on;
     float aus_vorher = this->fan_level;
     if (zelt_ok) zelt_je_ok = true;
-    if (t_boot < BOOT_WARTEN_NACHT) t_boot++;
+    if (t_boot < BOOT_ZAEHLEN) t_boot++;
     // Wechsel der Quelle (Schalter oder Ausfall, nach der Startphase): Die
     // Sensoren sitzen an verschiedenen Stellen, der VPD springt. Kalman-E
     // neu auf den Messwert setzen (sonst haelt er den Sprung fuer eine
@@ -663,15 +801,11 @@ class VpdKalmanCore {
   float tau_s_{21.0f};
   float leaf_max_dev_{6.0f};
 
-  // ---------- Speicher (war "static" im Lambda) ----------
-  bool gestartet = false, auto_vorher = false, nacht_vorher = false;
-  bool nacht_bekannt = false;       // Nachtphase hat schon einen Wert
-  bool zelt_je_ok = false;          // seit dem Booten schon ein gueltiger Zeltwert
-  int t_boot = 0;                   // Takte seit dem Booten (zaehlt bis BOOT_WARTEN_NACHT)
+  // ---------- Speicher (war "static" im Lambda, gemeinsamer Teil in CoreBase) ----------
+  bool gestartet = false;
   int t_phase = 0;                  // Takte seit dem letzten Lichtwechsel (bis PHASE_MERKEN)
   float u_kand = -1.0f;             // Kandidat zum Merken (Wert von vor MERK_TAKTE)
   int t_kand = 0;                   // Takte bis zum naechsten Merken
-  bool sich_t = false, sich_rh = false;   // Sicherheitsstufe aktiv (Hysterese)
   float u = 30.0f;                  // Stellwert des Reglers in %
   float u_max_s = NAN;              // sinnvolles Maximum in %
   float u_phase[2] = {-1.0f, -1.0f};   // gemerkter Luefter [0] Tag, [1] Nacht
@@ -680,17 +814,9 @@ class VpdKalmanCore {
   float p00 = 0, p01 = 0, p11 = 0;  // Kovarianz
   bool kalman_neu = false;          // nach "Zelt offen": E neu auf den Messwert
   bool e_neu = false;               // nach Sensorwechsel: nur E neu auf den Messwert
-  int quelle_vorher = -1;           // Zeltsensor im letzten Takt: 1 extern, 0 eigener, -1 noch keiner
-  bool offen_vorher = false;        // Schalter "Zelt offen" im letzten Takt
-  int t_offen = 0;                  // Takte seit "Zelt offen"
   float ziel_eff = NAN;             // wirksames Ziel im Sollwert-Übergang (NAN = keiner)
   float fuehr_rate = 0.0f;          // Mindestschritt des wirksamen Ziels je Takt, kPa
   bool fuehr_starten = false;       // Übergang beim naechsten Regeltakt starten
-  // Schutz-Episoden, [0] Temperatur, [1] Feuchte
-  bool schutz_vorher[2] = {false, false}, ep[2] = {false, false};
-  int ep_runden[2] = {0, 0}, ep_ruhe[2] = {0, 0};
-  uint32_t ep_start[2] = {0, 0}, ep_ende[2] = {0, 0};
-  float ep_max[2] = {NAN, NAN};
   std::string grund = "Restart";    // letztes Ereignis, nur fuers Log
   std::string zustand_vorher, grund_vorher;
   int t_sichern = 0;
