@@ -143,7 +143,8 @@ vpd_kalman:
   night: lights_off            # optional: binary sensor, ON = night
 ```
 
-This creates all settings and switches with English names. Without `night`
+This creates all settings and switches with English names, see
+[Entity names](#entity-names) to change them. Without `night`
 there is one *VPD target*, with it a day and a night target, see
 [below](#daynight-sensor-optional). The controller
 starts in **manual mode**: turn on the switch *VPD control* to let it drive
@@ -192,6 +193,65 @@ vpd_kalman:
 Keys of the other variant are rejected, as are the tuning parameters
 `light_memory_after`, `light_memory_delay`, `boot_wait_night` and
 `storage_keys` `day`/`night` without `night`.
+
+## Entity names
+
+Every entity has a key in the YAML (first column of the tables below). The
+keys stay English, the names are up to you. There are two kinds:
+
+- **Settings and switches** are always created, with the English default
+  name from the tables. To rename one, add its key with a `name`.
+- **Diagnostics, the switch `force_fallback` and tuning entities** are
+  optional. They only exist if you add their key with a `name`.
+
+```yaml
+vpd_kalman:
+  # ...
+
+  # Always created, only the name changes
+  control:
+    name: "Grow tent control"
+  tent_open:
+    name: "Tent door open"
+  fan_max:
+    name: "Exhaust max auto"
+  manual_speed:
+    name: "Exhaust manual"
+    id: exhaust_manual           # optional, for your own lambdas
+
+  # Optional, only created because they are listed here
+  fan_output:
+    name: "Exhaust output"
+  state:
+    name: "Controller state"
+  force_fallback:                # only with room sensor
+    name: "Use fallback controller"
+  tuning:
+    fallback_rate:
+      name: "Fallback controller rate"
+```
+
+Good to know:
+
+- Keys you leave out keep their default name (settings, switches) or are not
+  created (diagnostics).
+- Besides `name`, every entity accepts the usual ESPHome options such as
+  `id`, `icon`, `entity_category` or `disabled_by_default`, settings also
+  `min_value`, `max_value`, `step` and `initial_value`. `id` is only for your
+  own lambdas (`id(exhaust_manual).state`), Home Assistant does not see it.
+- Pick the names before you rely on the entities. Home Assistant derives the
+  entity ID from the device name and this name, and the value stored in flash
+  is tied to the name as well. If you change a `name` later, Home Assistant
+  creates a new entity (the history stays with the old one), settings start
+  again at `initial_value` and switches at their default from the *Restore*
+  column.
+- Targets and leaf offsets: rename the keys of your variant, see
+  [Day/night sensor](#daynight-sensor-optional). Adding `target` while
+  `night` is set does not just rename, it switches to one target for day and
+  night.
+- Tuning parameters also work without a name as a fixed value, see
+  [Tuning parameters](#tuning-parameters-optional). Only the block with
+  `name` creates an entity.
 
 ---
 
@@ -271,8 +331,8 @@ usual `restore_mode` option of the switch.
 
 ### Diagnostics (optional)
 
-Only created if you add the key (with at least a `name`). All accept the
-usual sensor options.
+Only created if you add the key (with at least a `name`), see
+[Entity names](#entity-names). All accept the usual sensor options.
 
 | Key | Unit | Meaning |
 |---|---|---|

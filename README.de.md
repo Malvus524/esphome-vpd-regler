@@ -159,7 +159,7 @@ vpd_kalman:
 ```
 
 Das legt alle Einstellungen und Schalter an, mit englischen Namen (eigene
-Namen gibst du über `name`, siehe [Einstellungen](#einstellungen-number-entitäten)).
+Namen: siehe [Namen der Entitäten](#namen-der-entitäten)).
 Ohne `night` gibt es ein *VPD target*, mit `night` ein Tag- und ein Nachtziel,
 siehe [unten](#tagnacht-sensor-optional). Der Regler startet im
 **Handbetrieb**: Schalte den Schalter *VPD control* ein, damit er den Lüfter
@@ -209,6 +209,69 @@ vpd_kalman:
 Schlüssel der jeweils anderen Variante werden abgelehnt, ebenso ohne `night`
 die Tuning-Parameter `light_memory_after`, `light_memory_delay`,
 `boot_wait_night` und die `storage_keys` `day`/`night`.
+
+## Namen der Entitäten
+
+Jede Entität hat im YAML einen Schlüssel (erste Spalte der Tabellen unten).
+Die Schlüssel bleiben englisch, die Namen legst du selbst fest. Es gibt zwei
+Arten:
+
+- **Einstellungen und Schalter** werden immer angelegt, mit dem englischen
+  Standardnamen aus den Tabellen. Um einen umzubenennen, schreib seinen
+  Schlüssel mit `name` dazu.
+- **Diagnosen, der Schalter `force_fallback` und Tuning-Entitäten** sind
+  optional. Es gibt sie nur, wenn du ihren Schlüssel mit `name` hinzufügst.
+
+```yaml
+vpd_kalman:
+  # ...
+  language: de
+
+  # Immer angelegt, nur der Name ändert sich
+  control:
+    name: "VPD Regelung"
+  tent_open:
+    name: "Zelt offen"
+  fan_max:
+    name: "Lüfter Maximum Automatik"
+  manual_speed:
+    name: "Lüfter Handdrehzahl"
+    id: luefter_hand             # optional, für eigene Lambdas
+
+  # Optional, nur angelegt, weil sie hier stehen
+  fan_output:
+    name: "Lüfter Ausgang"
+  state:
+    name: "VPD Regler Zustand"
+  force_fallback:                # nur mit Raumsensor
+    name: "Ersatzregler nutzen"
+  tuning:
+    fallback_rate:
+      name: "Ersatzregler Rate"
+```
+
+Gut zu wissen:
+
+- Schlüssel, die du weglässt, behalten ihren Standardnamen (Einstellungen,
+  Schalter) oder werden nicht angelegt (Diagnosen).
+- Neben `name` akzeptiert jede Entität die üblichen ESPHome-Optionen wie
+  `id`, `icon`, `entity_category` oder `disabled_by_default`, Einstellungen
+  außerdem `min_value`, `max_value`, `step` und `initial_value`. `id`
+  brauchst du nur für eigene Lambdas (`id(luefter_hand).state`), Home
+  Assistant sieht sie nicht.
+- Leg die Namen fest, bevor du dich auf die Entitäten verlässt. Home
+  Assistant bildet die Entitäts-ID aus Gerätename und Name, und auch der im
+  Flash gespeicherte Wert hängt am Namen. Änderst du einen `name` später,
+  legt Home Assistant eine neue Entität an (der Verlauf bleibt bei der
+  alten), Einstellungen beginnen wieder bei `initial_value` und Schalter bei
+  ihrem Standard aus der Spalte *Wiederherstellung*.
+- Ziele und Blatt-Offsets: Benenne die Schlüssel deiner Variante um, siehe
+  [Tag/Nacht-Sensor](#tagnacht-sensor-optional). `target` zusätzlich zu
+  `night` benennt nicht nur um, sondern schaltet auf ein Ziel für Tag und
+  Nacht.
+- Tuning-Parameter gehen ohne Namen auch als fester Wert, siehe
+  [Tuning-Parameter](#tuning-parameter-optional). Erst der Block mit `name`
+  legt eine Entität an.
 
 ---
 
@@ -293,7 +356,8 @@ Neustart aus. Ändern kannst du das mit der üblichen Schalter-Option
 ### Diagnose (optional)
 
 Wird nur angelegt, wenn du den Schlüssel (mit mindestens einem `name`)
-hinzufügst. Alle akzeptieren die üblichen Sensor-Optionen.
+hinzufügst, siehe [Namen der Entitäten](#namen-der-entitäten). Alle
+akzeptieren die üblichen Sensor-Optionen.
 
 | Schlüssel | Einheit | Bedeutung |
 |---|---|---|
