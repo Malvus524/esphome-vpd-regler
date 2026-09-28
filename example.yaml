@@ -1,0 +1,141 @@
+# ==================================================================
+# Example: grow tent VPD controller with one exhaust fan
+# ------------------------------------------------------------------
+# ESP32 with two SHT4x (tent and room, on separate I2C buses because both
+# use address 0x44), an optional MLX90614 for the leaf temperature and a
+# PWM fan. Day/night comes from a light schedule here - a light sensor
+# works just as well (binary sensor ON = night).
+# ==================================================================
+esphome:
+  name: grow-tent
+  friendly_name: Grow tent
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source: github://Malvus524/esphome-vpd-regler@v1.0.0
+    components: [vpd_kalman]
+
+logger:
+api:
+  encryption:
+    key: !secret api_encryption_key
+ota:
+  - platform: esphome
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # The controller keeps running without WiFi and Home Assistant
+  reboot_timeout: 0s
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+i2c:
+  - id: bus_tent
+    sda: GPIO21
+    scl: GPIO22
+  - id: bus_room
+    sda: GPIO16
+    scl: GPIO17
+
+sensor:
+  - platform: sht4x
+    i2c_id: bus_tent
+    temperature:
+      id: tent_temperature
+      name: "Tent temperature"
+    humidity:
+      id: tent_humidity
+      name: "Tent humidity"
+    update_interval: 10s
+
+  - platform: sht4x
+    i2c_id: bus_room
+    temperature:
+      id: room_temperature
+      name: "Room temperature"
+    humidity:
+      id: room_humidity
+      name: "Room humidity"
+    update_interval: 10s
+
+  # Optional: leaf temperature (IR). Remove together with
+  # leaf_temperature below if you have none.
+  - platform: mlx90614
+    i2c_id: bus_tent
+    update_interval: 10s
+    object:
+      id: leaf_temperature
+      name: "Leaf temperature"
+      emissivity: 0.96
+
+# Fan: 0-10 V or PWM input. The controller writes 1-100 % and never
+# switches the fan off; min_power/max_power map that to your fan.
+output:
+  - platform: ledc
+    pin: GPIO25
+    id: fan_pwm
+    frequency: 1000Hz
+    min_power: 7%
+
+# Lights on 06:00-24:00. Replace with a light sensor if you have one.
+binary_sensor:
+  - platform: template
+    id: lights_off
+    name: "Night"
+    lambda: |-
+      auto now = id(ha_time).now();
+      if (!now.is_valid()) return {};
+      return now.hour < 6;
+
+vpd_kalman:
+  output: fan_pwm
+  night: lights_off
+  temperature: tent_temperature
+  humidity: tent_humidity
+  leaf_temperature: leaf_temperature
+  room_temperature: room_temperature
+  room_humidity: room_humidity
+  # Tent model, see README
+  airflow_at_zero: 0.2
+  time_constant: 21s
+
+  # Settings and switches are created with default names - rename or
+  # change defaults like this:
+  target_day:
+    name: "VPD target day"
+    initial_value: 1.2
+
+  # Diagnostics (optional)
+  control_vpd:
+    name: "VPD control value"
+  target_active:
+    name: "VPD target active"
+  fan_output:
+    name: "Fan output"
+  controller_output:
+    name: "VPD controller output"
+  sensible_max:
+    name: "VPD controller sensible maximum"
+  moisture_load:
+    name: "Moisture load"
+  vpd_at_max:
+    name: "VPD reachable at fan max"
+  state:
+    name: "VPD controller state"
+  temperature_protection:
+    name: "Temperature protection active"
+  humidity_protection:
+    name: "Humidity protection active"
+
+  on_message:
+    - homeassistant.action:
+        action: notify.notify
+        data:
+          title: !lambda 'return title;'
+          message: !lambda 'return message;'
