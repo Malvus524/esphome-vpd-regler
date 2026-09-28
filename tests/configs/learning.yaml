@@ -1,0 +1,32 @@
+packages:
+  kalman: !include kalman.yaml
+
+binary_sensor:
+  - platform: template
+    id: night_phase
+    lambda: return false;
+
+sensor:
+  - platform: template
+    id: leaf_t
+    lambda: return 23.0f;
+    update_interval: 10s
+
+vpd_kalman:
+  night: night_phase
+  leaf_temperature: leaf_t
+  learn_fan_curve: true
+  learned_airflow_50:
+    name: Learned airflow
+  fan_curve_learned:
+    name: Learned curve active
+  tuning:
+    sensor_noise: 0.01
+    fallback_rate:
+      name: Fallback rate
+      initial_value: 8
+  external_climate: |-
+    vpd_kalman::ExternalClimate value;
+    value.selected = false;
+    value.sample_age_ms = UINT32_MAX;
+    return value;

@@ -57,19 +57,23 @@ class VpdKalman : public PollingComponent {
   float get_setup_priority() const override { return -100.0f; }
 
   // ---------- Configuration ----------
+  void set_sensor_timeout(uint32_t ms) { this->in_.sensor_timeout_ms = ms; }
+  void set_safety_in_manual(bool value) { this->in_.safety_in_manual = value; }
   void set_output(output::FloatOutput *out) { this->output_ = out; }
   // Without night sensor the controller always runs in the day phase
   void set_night(binary_sensor::BinarySensor *s) { this->night_ = s; }
-  void set_temperature(sensor::Sensor *s) { this->temperature_ = s; }
-  void set_humidity(sensor::Sensor *s) { this->humidity_ = s; }
-  void set_leaf_temperature(sensor::Sensor *s) { this->leaf_temperature_ = s; }
+  void set_temperature(sensor::Sensor *s) { this->temperature_ = s; this->watch_sensor_(s, 0); }
+  void set_humidity(sensor::Sensor *s) { this->humidity_ = s; this->watch_sensor_(s, 1); }
+  void set_leaf_temperature(sensor::Sensor *s) { this->leaf_temperature_ = s; this->watch_sensor_(s, 2); }
   // Both room sensors set = Kalman controller with fallback, none = fallback only
   void set_room_temperature(sensor::Sensor *s) {
     this->room_temperature_ = s;
+    this->watch_sensor_(s, 3);
     this->core_.set_room_configured(this->room_temperature_ != nullptr && this->room_humidity_ != nullptr);
   }
   void set_room_humidity(sensor::Sensor *s) {
     this->room_humidity_ = s;
+    this->watch_sensor_(s, 4);
     this->core_.set_room_configured(this->room_temperature_ != nullptr && this->room_humidity_ != nullptr);
   }
   void set_external_climate(std::function<ExternalClimate()> &&f) { this->external_climate_ = f; }
@@ -117,6 +121,7 @@ class VpdKalman : public PollingComponent {
   void set_force_fallback_switch(VpdSwitch *s) { this->force_fallback_ = s; }
 
   // Diagnostics (all optional)
+  void set_measured_vpd_sensor(sensor::Sensor *s) { this->s_measured_vpd_ = s; }
   void set_control_vpd_sensor(sensor::Sensor *s) { this->s_control_vpd_ = s; }
   void set_target_active_sensor(sensor::Sensor *s) { this->s_target_active_ = s; }
   void set_controller_output_sensor(sensor::Sensor *s) { this->s_controller_output_ = s; }
@@ -154,7 +159,9 @@ class VpdKalman : public PollingComponent {
   void apply_level_(float level);
   static void publish_binary_(binary_sensor::BinarySensor *b, bool state);
   static float state_of_(number::Number *n) { return n == nullptr ? NAN : n->state; }
-  static float state_of_(sensor::Sensor *s) { return s == nullptr ? NAN : s->state; }
+  void watch_sensor_(sensor::Sensor *sensor, unsigned index);
+  float fresh_state_(sensor::Sensor *sensor, unsigned index);
+  SampleClock sensor_clock_[5];
 
   VpdControllerCore core_;
   Inputs in_;
@@ -174,6 +181,7 @@ class VpdKalman : public PollingComponent {
   VpdNumber *tuning_number_[TUNING_COUNT] = {};
   VpdSwitch *control_{nullptr}, *tent_open_{nullptr}, *leaf_switch_{nullptr}, *force_fallback_{nullptr};
 
+  sensor::Sensor *s_measured_vpd_{nullptr};
   sensor::Sensor *s_control_vpd_{nullptr}, *s_target_active_{nullptr}, *s_controller_output_{nullptr},
       *s_sensible_max_{nullptr}, *s_fan_output_{nullptr}, *s_excess_{nullptr}, *s_excess_target_{nullptr},
       *s_moisture_load_{nullptr}, *s_next_step_benefit_{nullptr}, *s_vpd_at_max_{nullptr};
@@ -193,9 +201,11 @@ class VpdKalman : public PollingComponent {
   float stored_u_{NAN}, stored_day_{NAN}, stored_night_{NAN};
   // Scores of the fan curve bank, saved every 6 h and when it takes over or
   // gives up, so a restart does not start learning from scratch
+#ifdef USE_VPD_FAN_CURVE
   FanCurveBank::Stored stored_curve_{};
   uint32_t curve_ticks_{0};
   bool curve_active_saved_{false};
+#endif
 };
 
 }  // namespace vpd_kalman

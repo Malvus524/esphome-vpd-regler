@@ -10,11 +10,13 @@ on:
     branches: [main, dev]
     paths:
       - "components/**"
+      - "tests/**"
       - "example.yaml"
       - ".github/workflows/build.yml"
   pull_request:
     paths:
       - "components/**"
+      - "tests/**"
       - "example.yaml"
       - ".github/workflows/build.yml"
   schedule:
@@ -22,6 +24,30 @@ on:
   workflow_dispatch:
 
 jobs:
+  behavior:
+    name: Controller behavior and configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install esphome
+      - run: python -m unittest discover -s tests -v
+      - name: Core without learning
+        run: |
+          g++ -std=c++17 -O2 -I . tests/test_core.cpp -o /tmp/vpd-core-test
+          /tmp/vpd-core-test
+      - name: Core with learning
+        run: |
+          g++ -std=c++17 -O2 -DUSE_VPD_FAN_CURVE -I . tests/test_core.cpp -o /tmp/vpd-learning-test
+          /tmp/vpd-learning-test
+
+      - name: Closed-loop scenarios
+        run: |
+          g++ -std=c++17 -O2 -I . tests/simulate_control.cpp -o /tmp/vpd-simulation
+          /tmp/vpd-simulation
+
   compile:
     name: ESPHome ${{ matrix.esphome }}
     runs-on: ubuntu-latest
@@ -67,3 +93,9 @@ jobs:
 
       - name: Compile
         run: esphome compile ci.yaml
+
+      - name: Compile configuration variants
+        run: |
+          esphome compile tests/configs/fallback.yaml
+          esphome compile tests/configs/kalman.yaml
+          esphome compile tests/configs/learning.yaml

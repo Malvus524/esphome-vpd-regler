@@ -18,6 +18,72 @@
 > Technik schaden könnte. Es gibt keinerlei Gewährleistung (siehe
 > [LICENSE](LICENSE)).
 
+## Entwicklungsversion: geändertes Verhalten
+
+Diese Änderungen gelten für den aktuellen Quellstand, nicht für den unten
+gepinnten Release `v1.0.0`. Zum Testen den lokalen Ordner `components` oder einen
+Commit verwenden, der diese Änderungen enthält.
+
+- `sensor_timeout: 2min`: Werte werden nach zwei Minuten ohne neue Veröffentlichung
+  ungültig. Den Timeout größer als das Veröffentlichungsintervall einschließlich
+  Filter setzen. Gleiche neue Messwerte bleiben gültig; Heartbeats mit alten Daten
+  lassen sich so nicht erkennen. Zulässig sind endliche Temperaturen von -40 bis
+  85 °C und Feuchte von 0 bis 100 %. Ungültige Raumwerte führen nach der zusätzlichen
+  `room_fallback_delay` zum Ersatzregler; ungültige Blattwerte zum Blatt-Offset.
+- `safety_in_manual: true`: Der Schutz wirkt auch im Handbetrieb. Ohne gültiges
+  Zeltklima gilt dort mindestens die Notlaufleistung. `false` stellt das bisherige
+  ungeschützte Handverhalten her. `fan_max` begrenzt weiterhin nur die normale
+  Automatik; der Schutz darf bis 100 % gehen.
+- `learn_fan_curve: false`: Das experimentelle Lernen ist optional und standardmäßig
+  aus; die großen Filterarrays entfallen dann beim Kompilieren. Zum Einschalten
+  `learn_fan_curve: true` und Raumsensoren konfigurieren. Lerndiagnosen verlangen
+  diese Option. Alte Lerndaten werden wegen des neuen Speicherformats verworfen;
+  normale Einstellungen bleiben erhalten.
+- Eigene Number-Grenzen müssen innerhalb der dokumentierten Bereiche liegen.
+  Startwerte, Schrittweiten und die Reihenfolge der anfänglichen Lüftergrenzen
+  werden geprüft. Bei widersprüchlichen Laufzeitwerten hat `fan_max` Vorrang vor
+  `fan_min`. `time_constant` erlaubt 10 s bis 1 h.
+- Normale Zielwertänderungen starten jetzt die Sollwertrampe. Lerndiagnosen werden
+  im Ersatzbetrieb gelöscht. Das Beispiel deaktiviert WLAN- und API-Neustarttimer.
+- `external_climate` benötigt `sample_age_ms`: das Alter des ältesten Werts des
+  vollständigen Pakets in Millisekunden. Ohne Altersangabe oder bei veralteten
+  Daten werden die eigenen Sensoren verwendet. Die Empfangszeit im Empfänger
+  erfassen, nicht in der Klima-Lambda. Externe Blattwerte berücksichtigen jetzt
+  ebenfalls `leaf_max_deviation`.
+
+Die Schleife setzt weiterhin einen festen 10-s-Takt voraus. Die Uhrzeit im Beispiel
+kommt von Home Assistant: Nach einem Kaltstart ohne gültige Zeit ist der Tag-/Nachtplan
+unbekannt. Für Unabhängigkeit einen lokalen Lichtsensor oder eine geeignete RTC nutzen.
+
+Die [Regressionstests](tests/README.md) beschreiben Prüfungen und verbleibende Grenzen.
+Die Regelstrategie filtert jetzt Ausreißer und berücksichtigt einen bereits
+steigenden VPD. Die Grenzsuchstrategie des Ersatzreglers bleibt erhalten.
+
+### Ruhigere Regelung
+
+Einzelne VPD-Sprünge mit mehr als 0,1 kPa Abstand zum Median der letzten drei
+Regeltakte werden unterdrückt. Kleinere Änderungen passieren sofort; anhaltende
+große Änderungen werden beim zweiten Messwert angenommen. Der Hauptregler glättet
+zusätzlich mit `control_smoothing: 10s`; der Ersatzregler verwendet weiterhin
+`fallback_smoothing: 30s`. Nach Sensorausfall, Quellenwechsel oder Öffnen des
+Zelts wird die Messhistorie zurückgesetzt.
+
+Nach zwei aufeinanderfolgenden VPD-Anstiegen verringert `trend_horizon: 30s`
+weitere Leistungssteigerungen, wenn sich das Klima bereits dem Zielband nähert.
+`fan_increase_rate: 30` begrenzt normale Regelkorrekturen auf 30 Prozentpunkte
+pro Minute. Schutz, gespeicherte Tag-/Nachtwerte und gezielte Grenzsuchschritte
+sind davon ausgenommen. Nach einem Schutzeingriff sinkt die zusätzliche Leistung
+im Automatikbetrieb mit `protection_release_rate: 20` Prozentpunkten pro Minute.
+Neue Schutzanforderungen wirken sofort auf Basis der ungefilterten Messwerte.
+Handbefehle und Sensorausfall unterbrechen diesen sanften Rücklauf.
+
+Alle vier Optionen stehen unter `tuning` und funktionieren ohne zusätzliche
+Konfiguration. `control_smoothing` (nur mit Raumsensoren) und `trend_horizon`
+erlauben 0–120 s; `0s` deaktiviert jeweils Glättung bzw. Vorausschau.
+`fan_increase_rate` erlaubt 1–600, `protection_release_rate` 1–100 Prozentpunkte
+pro Minute. `control_vpd` zeigt den gefilterten Regelwert; der optionale
+Diagnosesensor `measured_vpd` zeigt den ungefilterten VPD.
+
 ## Warum ein eigener VPD-Regler?
 
 Das VPD entscheidet, wie viel Wasser die Pflanzen verdunsten: Ist es zu
@@ -361,7 +427,8 @@ akzeptieren die üblichen Sensor-Optionen.
 
 | Schlüssel | Einheit | Bedeutung |
 |---|---|---|
-| `control_vpd` | kPa | VPD, mit dem der Regler arbeitet (ungefiltert). |
+| `control_vpd` | kPa | Gefilterter VPD, mit dem der Regler arbeitet. |
+| `measured_vpd` | kPa | Ungefilterter VPD zur Diagnose. |
 | `target_active` | kPa | Wirksames Ziel, einschließlich Sollwert-Übergang. |
 | `controller_output` | % | Was der Regler will (vor der Sicherheit). |
 | `sensible_max` | % | Höchste sinnvolle Lüftereinstellung, siehe *Allowed VPD sacrifice*. |
@@ -393,7 +460,8 @@ Der Kalman-Regler nimmt eine gerade Lüfterkennlinie an (`airflow_at_zero`)
 und dass Zelt- und Raumsensor gleich messen. Viele Lüfter fördern schon weit
 unter 100 % fast ihre volle Luftmenge, und zwei Feuchtesensoren weichen oft
 um einige %rF voneinander ab. Beides verschiebt das *sinnvolle Maximum*. Die
-Komponente lernt beides selbst, ohne Testläufe und ohne Einstellung:
+experimentelle Lernfunktion schätzt beides mit `learn_fan_curve: true` im
+normalen Betrieb, ohne eigens dafür ausgelöste Lüfter-Testläufe:
 
 - Eine Bank aus 720 kleinen Filtern läuft mit, jeder eine Annahme über
   Kennlinie, Versatz des Zeltsensors (-4 ... +4 %rF) und Trägheit des
@@ -406,8 +474,9 @@ Komponente lernt beides selbst, ohne Testläufe und ohne Einstellung:
   als die eingestellte und 48 h stabil war. Dann nutzt sie nur das sinnvolle
   Maximum, das Regeltempo bleibt. Bis dahin arbeitet der Regler genau wie
   ohne Lernen.
-- Das dauert einige Tage. Ein Lüfter, der zu `airflow_at_zero` passt, wird
-  nie übernommen.
+- Das Lernen braucht ausreichend informative Änderungen über mehrere Tage;
+  eine Aktivierung ist nicht garantiert. Ein passendes eingestelltes Modell
+  sollte nicht ersetzt werden müssen.
 
 Optionale Diagnosen zeigen, was sie gelernt hat: `learned_airflow_50`,
 `learned_sensor_offset`, `learned_sensor_lag`, `learned_sensible_max` (auch
@@ -558,6 +627,15 @@ Sollwert-Übergang startet, weil zwei Sensoren an verschiedenen Stellen
 verschiedene VPDs messen.
 
 ```yaml
+globals:
+  # Update both from your receiver when a complete packet arrives.
+  - id: canopy_received
+    type: bool
+    initial_value: 'false'
+  - id: canopy_last_received_ms
+    type: uint32_t
+    initial_value: '0'
+
 switch:
   - platform: template
     id: use_canopy_sensor
@@ -570,6 +648,9 @@ vpd_kalman:
   external_climate: !lambda |-
     vpd_kalman::ExternalClimate c;
     c.selected = id(use_canopy_sensor).state;
+    // Updated by the receiver only when a complete packet arrives.
+    if (id(canopy_received))
+      c.sample_age_ms = millis() - id(canopy_last_received_ms);
     if (c.selected) {
       c.temperature = id(canopy_temperature).state;
       c.humidity = id(canopy_humidity).state;

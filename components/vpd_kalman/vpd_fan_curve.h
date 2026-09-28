@@ -47,12 +47,13 @@ class FanCurveBank {
   static constexpr int N_DYN = N_CURVE * N_TS;            // 80 (curve x lag share the dynamics)
   static constexpr int N = N_DYN * N_V;                   // 720 candidates
   static constexpr int HIST = 48;                         // hours the curve must be stable
-  static constexpr uint32_t STORE_VERSION = 0x46430003;
+  static constexpr uint32_t STORE_VERSION = 0x46430004;
 
   // Persistent part (scores), saved rarely by the caller
   struct Stored {
     uint32_t version;
     float q0_cfg;
+    float tau_s;
     float count;          // informative ticks, fading like the scores
     float score[N];
     float hist[HIST][3];  // learned airflow at 25/50/75 % once per hour
@@ -75,9 +76,13 @@ class FanCurveBank {
 
   /// Restore scores (false = nothing usable stored).
   bool load(const Stored &s) {
-    if (s.version != STORE_VERSION || s.q0_cfg != this->q0_cfg_ || !(s.count >= 0.0f)) return false;
+    if (s.version != STORE_VERSION || s.q0_cfg != this->q0_cfg_ || s.tau_s != this->tau_ ||
+        !std::isfinite(s.count) || s.count < 0.0f) return false;
     for (int i = 0; i < N; i++)
       if (!std::isfinite(s.score[i])) return false;
+    for (int h = 0; h < HIST; h++)
+      for (int j = 0; j < 3; j++)
+        if (!std::isfinite(s.hist[h][j]) || s.hist[h][j] < 0.0f || s.hist[h][j] > 1.0f) return false;
     this->count_ = s.count;
     for (int i = 0; i < N; i++) this->score_[i] = s.score[i];
     this->hist_n_ = std::min(std::max((int) s.hist_n, 0), HIST);
@@ -90,12 +95,24 @@ class FanCurveBank {
   void save(Stored &s) const {
     s.version = STORE_VERSION;
     s.q0_cfg = this->q0_cfg_;
+    s.tau_s = this->tau_;
     s.count = this->count_;
     for (int i = 0; i < N; i++) s.score[i] = this->score_[i];
     for (int h = 0; h < HIST; h++)
       for (int j = 0; j < 3; j++) s.hist[h][j] = this->hist_[h][j];
     s.hist_n = this->hist_n_;
     s.active = this->active_ ? 1 : 0;
+  }
+
+  // A fallback interval is not a single 10 s model step. Discard the
+  // unfinished scoring block and reinitialise the dynamic state on return.
+  void resume() {
+    this->reinit_ = true;
+    this->u_prev_ = NAN;
+    this->since_change_ = 1 << 20;
+    this->block_n_ = this->block_age_ = 0;
+    for (float &value : this->block_) value = 0.0f;
+    this->block_clean_ = false;
   }
 
   // ---------- One tick (10 s) ----------

@@ -12,6 +12,68 @@
 > and do not leave it unsupervised where a wrong fan setting could harm your
 > plants or equipment. It comes without any warranty (see [LICENSE](LICENSE)).
 
+## Development version: behavior changes
+
+These changes apply to the current source, not the pinned `v1.0.0` release below.
+For testing, use the local `components` directory or a commit containing them.
+
+- `sensor_timeout: 2min`: readings expire after two minutes without a new sensor
+  publication. Set this above the publication interval including filters.
+  Identical new readings remain valid; heartbeats repeating old data cannot be
+  distinguished from fresh measurements. Finite temperatures within -40..85 °C
+  and humidity within 0..100 % are required. Invalid room data triggers fallback
+  after the additional `room_fallback_delay`; invalid leaf data uses the offset.
+- `safety_in_manual: true`: protection also applies in manual mode, including an
+  emergency-speed floor without valid tent climate. Set `false` for the previous
+  unprotected manual behavior. `fan_max` still limits only automatic regulation;
+  protection may reach 100 %.
+- `learn_fan_curve: false`: experimental learning is opt-in; the large filter
+  arrays are compiled out by default. Enable with `learn_fan_curve: true` and
+  room sensors. Learning diagnostics require this option. Old learning records
+  are discarded due to the new storage format; normal settings are retained.
+- Custom number ranges must stay inside the documented bounds. Initial values,
+  steps and initial fan-limit ordering are validated. At runtime `fan_max` takes
+  precedence over a conflicting `fan_min`. `time_constant` accepts 10 s to 1 h.
+- Ordinary target changes now start the setpoint ramp. Learning diagnostics are
+  cleared during fallback. The example disables both WiFi and API reboot timers.
+- `external_climate` requires `sample_age_ms`: the age of the oldest reading in
+  the complete packet, in milliseconds. Missing or expired age selects the own
+  sensors. Record reception time in the receiver, not in the climate lambda.
+  External leaf readings also respect `leaf_max_deviation`.
+
+The loop still assumes a fixed 10 s tick. The example receives time from Home
+Assistant: after a cold boot without valid time its day/night schedule is unknown.
+Use a local light sensor or suitable RTC if that dependency is undesirable.
+
+See [regression tests](tests/README.md) for validation and remaining limitations.
+The control strategy now rejects outliers and accounts for an already rising
+VPD. The fallback limit-search strategy is retained.
+
+### Smoother regulation
+
+Isolated VPD jumps more than 0.1 kPa from the median of the last three control
+ticks are rejected. Smaller changes pass immediately; sustained large changes
+are accepted on the second sample. The main controller also uses a
+`control_smoothing: 10s` low-pass filter; fallback retains its existing
+`fallback_smoothing: 30s` moving average. Measurement history resets after
+invalid input, source changes or opening the tent.
+
+After two consecutive VPD rises, `trend_horizon: 30s` reduces further fan
+increases when the climate is already approaching the target band.
+`fan_increase_rate: 30` limits normal feedback corrections to 30 percentage
+points per minute. Protection, stored day/night outputs and deliberate
+limit-search steps bypass this limit. After protection, the extra output
+decreases in automatic mode at `protection_release_rate: 20` percentage points
+per minute. New protection requests act immediately on unfiltered readings.
+Manual commands and sensor failure interrupt this gradual return.
+
+All four options belong under `tuning` and work without additional configuration.
+`control_smoothing` (requires room sensors) and `trend_horizon` accept 0–120 s;
+`0s` disables smoothing or anticipation respectively. `fan_increase_rate` accepts
+1–600 and `protection_release_rate` 1–100 percentage points per minute.
+`control_vpd` reports the filtered control value; the optional diagnostic sensor
+`measured_vpd` reports unfiltered VPD.
+
 ## Why a dedicated VPD controller?
 
 VPD decides how much water the plants evaporate: too low and they barely
@@ -336,7 +398,8 @@ Only created if you add the key (with at least a `name`), see
 
 | Key | Unit | Meaning |
 |---|---|---|
-| `control_vpd` | kPa | VPD the controller works with (unfiltered). |
+| `control_vpd` | kPa | Filtered VPD used for regulation. |
+| `measured_vpd` | kPa | Unfiltered VPD for diagnostics. |
 | `target_active` | kPa | Effective target, including the setpoint transition. |
 | `controller_output` | % | What the controller wants (before safety). |
 | `sensible_max` | % | Highest useful fan setting, see *Allowed VPD sacrifice*. |
@@ -367,8 +430,8 @@ Only created if you add the key (with at least a `name`), see
 The Kalman controller assumes a straight fan curve (`airflow_at_zero`) and
 tent and room sensor that agree. Many fans move most of their air well below
 100 %, and two humidity sensors often differ by a few %RH. Both shift the
-*sensible maximum*. The component learns them by itself, without test runs
-and without a setting:
+*sensible maximum*. With `learn_fan_curve: true`, the experimental learner
+estimates them during ordinary operation, without dedicated fan test runs:
 
 - A bank of 720 small filters runs alongside, each one assumption about fan
   curve, tent sensor offset (-4 ... +4 %RH) and tent sensor lag (0-60 s),
@@ -380,8 +443,8 @@ and without a setting:
   configured one and has been stable for 48 h. Then only the sensible maximum
   uses it, the control speed stays as it is. Until then the controller works
   exactly as without learning.
-- It takes a few days. A fan that matches `airflow_at_zero` is never taken
-  over.
+- Learning needs sufficiently informative changes over several days; activation
+  is not guaranteed. A matching configured model should not need replacement.
 
 Optional diagnostics show what it has learned: `learned_airflow_50`,
 `learned_sensor_offset`, `learned_sensor_lag`, `learned_sensible_max` (also
@@ -526,6 +589,15 @@ changes, the filter is re-synchronised and a setpoint transition starts,
 because two sensors at different places measure different VPDs.
 
 ```yaml
+globals:
+  # Update both from your receiver when a complete packet arrives.
+  - id: canopy_received
+    type: bool
+    initial_value: 'false'
+  - id: canopy_last_received_ms
+    type: uint32_t
+    initial_value: '0'
+
 switch:
   - platform: template
     id: use_canopy_sensor
@@ -538,6 +610,9 @@ vpd_kalman:
   external_climate: !lambda |-
     vpd_kalman::ExternalClimate c;
     c.selected = id(use_canopy_sensor).state;
+    // Updated by the receiver only when a complete packet arrives.
+    if (id(canopy_received))
+      c.sample_age_ms = millis() - id(canopy_last_received_ms);
     if (c.selected) {
       c.temperature = id(canopy_temperature).state;
       c.humidity = id(canopy_humidity).state;

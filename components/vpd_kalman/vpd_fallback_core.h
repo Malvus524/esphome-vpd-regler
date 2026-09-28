@@ -141,18 +141,20 @@ class VpdFallbackCore : public CoreBase {
   // upper_limit (the last sensible maximum of the Kalman controller, NAN =
   // fan max), but never below the current fan.
   void take_over(const Inputs &in, float upper_limit, const std::string &reason) {
-    auto par = [](float v, float def) { return std::isnan(v) ? def : v; };
+    auto par = [](float v, float def) { return !std::isfinite(v) ? def : v; };
     auto begrenze = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
-    float u_min = par(in.fan_min, 5.0f);
-    float u_max = std::max(par(in.fan_max, 100.0f), u_min);
+    float u_max = begrenze(par(in.fan_max, 100.0f), 1.0f, 100.0f);
+    float u_min = begrenze(par(in.fan_min, 5.0f), 1.0f, u_max);
     bool nacht = in.night_has_state ? in.night : nacht_vorher;
     gestartet = true;
-    u = begrenze(this->fan_level, u_min, u_max);
+    u = begrenze(this->handover_level_(), u_min, u_max);
     u_grenze = std::isnan(upper_limit) ? u_max : begrenze(std::max(upper_limit, u), u_min, u_max);
     ziel_vorher = par(nacht ? in.target_night : in.target_day, 1.0f);
     // Verlauf und Grenzfinder fangen neu an, der alte Stand ist veraltet
     test = false; t_stat = 0; t_pause = 0; pause_soll = 0; richtung = -1;
     et_gueltig = false; gn = 0; vn = 0;
+    this->vpd_median_.reset();
+    this->vpd_response_.reset();
     drift = dv = j0 = j1 = NAN;
     ziel_eff = NAN; fuehr_starten = false;
     zustand_vorher.clear();
@@ -182,7 +184,7 @@ class VpdFallbackCore : public CoreBase {
     const int SCHUTZ_RUHE = tuning_ticks(tn.all_clear_after, 6.0f, 360);   // Takte (60 min) = Episode vorbei
 
     // ---------- Einstellwerte ----------
-    auto par = [](float v, float def) { return std::isnan(v) ? def : v; };
+    auto par = [](float v, float def) { return !std::isfinite(v) ? def : v; };
     auto begrenze = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
     bool nacht = in.night_has_state ? in.night : nacht_vorher;
     float ziel    = par(nacht ? in.target_night : in.target_day, 1.0f);
@@ -193,9 +195,9 @@ class VpdFallbackCore : public CoreBase {
     float tempo   = std::max(par(tn.fallback_rate, 10.0f), 1.0f);
     float lam     = par(tn.limit_finder_cost, 4.0f);
     float schritt = par(tn.limit_finder_step, 15.0f);
-    float u_min   = par(in.fan_min, 5.0f);
-    float u_max   = std::max(par(in.fan_max, 100.0f), u_min);
-    float notlauf = par(in.emergency, 40.0f);
+    float u_max   = begrenze(par(in.fan_max, 100.0f), 1.0f, 100.0f);
+    float u_min   = begrenze(par(in.fan_min, 5.0f), 1.0f, u_max);
+    float notlauf = begrenze(par(in.emergency, 40.0f), 1.0f, 100.0f);
     float t_max   = par(in.temp_max, 28.0f);
     float t_band  = std::max(par(in.temp_band, 3.0f), 0.5f);
     float rh_max  = par(in.rh_max, 75.0f);
@@ -228,8 +230,10 @@ class VpdFallbackCore : public CoreBase {
     // vollstaendig. Sonst eigener Sensor: Blatttemperatur vom Blattsensor
     // (Schalter AN, plausibel), sonst Zelttemperatur + Blatt-Offset Tag/Nacht.
     bool unten_gewaehlt = in.ext.selected;
-    bool unten = unten_gewaehlt && !std::isnan(in.ext.temperature) &&
-                 !std::isnan(in.ext.humidity) && !std::isnan(in.ext.leaf_temperature);
+    bool unten = unten_gewaehlt && valid_climate(in.ext.temperature, in.ext.humidity) &&
+                 valid_temperature(in.ext.leaf_temperature) &&
+                 fabsf(in.ext.leaf_temperature - in.ext.temperature) <= this->leaf_max_dev_ &&
+                 in.ext.sample_age_ms < in.sensor_timeout_ms;
     float T, RH, T_blatt;
     if (unten) {
       T = in.ext.temperature; RH = in.ext.humidity; T_blatt = in.ext.leaf_temperature;
@@ -237,29 +241,37 @@ class VpdFallbackCore : public CoreBase {
       T = in.t; RH = in.rh;
       float offset = par(nacht ? in.leaf_offset_night : in.leaf_offset_day, -2.0f);
       float mlx = in.leaf;
-      T_blatt = (in.leaf_switch && !std::isnan(mlx) &&
+      T_blatt = (in.leaf_switch && valid_temperature(mlx) &&
                  fabsf(mlx - T) <= this->leaf_max_dev_) ? mlx : T + offset;
     }
-    bool mess_ok = !std::isnan(T) && !std::isnan(RH) && !std::isnan(T_blatt);
+    bool mess_ok = valid_climate(T, RH) && valid_temperature(T_blatt);
     bool auto_an = in.auto_on;
     float aus_vorher = this->fan_level;
     if (mess_ok) zelt_je_ok = true;
     if (t_boot < BOOT_ZAEHLEN) t_boot++;
     // Wechsel der Quelle nach der Startphase: der VPD springt, Glaettung
     // und Verlauf gehoeren zum alten Sensor
-    bool quelle_neu = t_boot >= BOOT_WARTEN_NACHT && quelle_vorher >= 0 && quelle_vorher != (int) unten;
+    const bool signal_source_changed = quelle_vorher >= 0 && quelle_vorher != (int) unten;
+    bool quelle_neu = t_boot >= BOOT_WARTEN_NACHT && signal_source_changed;
     quelle_vorher = unten ? 1 : 0;
-    if (quelle_neu) { gn = 0; vn = 0; }
+    const bool signal_reset = !mess_ok || in.tent_open ||
+        signal_source_changed || (nacht_bekannt && nacht != nacht_vorher) ||
+        (offen_vorher && !in.tent_open);
+    if (signal_reset) {
+      gn = 0; vn = 0;
+      this->vpd_median_.reset(); this->vpd_response_.reset();
+    }
 
     // Regelgroesse: Mittel der letzten GLAETTEN Messungen (30 s)
+    const float measured_vpd = mess_ok ? svp(T_blatt) - svp(T) * RH / 100.0f : NAN;
     float vpd = NAN;
     if (mess_ok) {
-      gbuf[gh] = svp(T_blatt) - svp(T) * RH / 100.0f;
+      gbuf[gh] = this->vpd_median_.update(measured_vpd);
       gh = (gh + 1) % GLAETTEN_MAX; if (gn < GLAETTEN_MAX) gn++;
       int m = std::min(gn, GLAETTEN);
       float s = 0;
       for (int i = 1; i <= m; i++) s += gbuf[(gh - i + GLAETTEN_MAX) % GLAETTEN_MAX];
-      vpd = s / m;
+      vpd = this->vpd_response_.update(s / m, 10.0f, 0.0f);
       vbuf[vh] = vpd; vh = (vh + 1) % NBUF; if (vn < NBUF) vn++;
     }
 
@@ -300,17 +312,11 @@ class VpdFallbackCore : public CoreBase {
     // ---------- Sicherheit (wie im Kalman-Regler) ----------
     // Ueber der Schwelle sofort mindestens Notlauf, dann linear ueber
     // das P-Band bis 100 %. Aus erst wieder unter Schwelle - Hysterese.
-    auto sicherheit = [&](float wert, float schwelle, float p_band, float hyst, bool &aktiv) -> float {
-      if (std::isnan(wert)) { aktiv = false; return 0.0f; }
-      if (wert > schwelle) aktiv = true;
-      else if (wert < schwelle - hyst) aktiv = false;
-      if (!aktiv) return 0.0f;
-      return begrenze(notlauf + (100.0f - notlauf) * std::max(wert - schwelle, 0.0f) / p_band,
-                      0.0f, 100.0f);
-    };
-    float u_temp = sicherheit(T, t_max, t_band, T_HYST, sich_t);
-    float u_rh = sicherheit(RH, rh_max, rh_band, RH_HYST, sich_rh);
+    float u_temp = protection_output(valid_temperature(T) ? T : NAN, t_max, t_band, T_HYST, notlauf, sich_t);
+    float u_rh = protection_output(valid_humidity(RH) ? RH : NAN, rh_max, rh_band, RH_HYST, notlauf, sich_rh);
     float u_sicher = std::max(u_temp, u_rh);
+    this->manual_safety_floor_ = in.safety_in_manual
+        ? std::max(u_sicher, mess_ok ? 0.0f : notlauf) : 0.0f;
 
     // ---------- Start und Ereignisse ----------
     if (!gestartet) {
@@ -367,6 +373,7 @@ class VpdFallbackCore : public CoreBase {
     }
     if (std::isnan(ziel_vorher) || fabsf(ziel - ziel_vorher) > 0.0005f) {
       ziel_vorher = ziel;
+      fuehr_starten = true;
       test_abbrechen(fx.a_target, false);
       u_grenze = u_max; t_stat = 0;
       grund = fx.r_target;
@@ -384,9 +391,14 @@ class VpdFallbackCore : public CoreBase {
     char zustand[48];
     if (!auto_an) {
       // ================= HAND =================
-      ausgang = par(in.manual_speed, 50.0f);
+      ausgang = std::max(par(in.manual_speed, 50.0f), this->manual_safety_floor_);
       fuehr_starten = false; ziel_eff = NAN;  // kein alter Übergang beim Einschalten
-      snprintf(zustand, sizeof(zustand), "%s", tx.manual);
+      if (in.safety_in_manual && !mess_ok)
+        snprintf(zustand, sizeof(zustand), "%s", tx.tent_sensor_error);
+      else if (in.safety_in_manual && u_sicher > par(in.manual_speed, 50.0f))
+        snprintf(zustand, sizeof(zustand), tx.safety_fmt, u_temp >= u_rh ? tx.safety_temp : tx.safety_rh);
+      else
+        snprintf(zustand, sizeof(zustand), "%s", tx.manual);
 
     } else if ((!mess_ok && !zelt_je_ok && t_boot < BOOT_WARTEN) ||
                (mess_ok && !nacht_bekannt && t_boot < BOOT_WARTEN_NACHT)) {
@@ -433,7 +445,7 @@ class VpdFallbackCore : public CoreBase {
       float e = vpd - ziel_w;
       float et = e > band ? e - band : (e < -band ? e + band : 0.0f);
       if (!et_gueltig) { et_vorher = et; et_gueltig = true; }
-      bool sicher = u_sicher > u + 1.0f;
+      bool sicher = u_sicher > u + 1.0f || this->protection_release_.above(u);
       t_pause++;
 
       // ================= EBENE 2: GRENZFINDER =================
@@ -491,7 +503,9 @@ class VpdFallbackCore : public CoreBase {
       if (!sicher) {
         float x = logf(u + U0) - ki * (tau * (et - et_vorher) + et * DT);
         x = begrenze(x, logf(u_min + U0), logf(u_grenze + U0));
-        u = expf(x) - U0;
+        u = limit_fan_increase(u, expf(x) - U0,
+            this->vpd_response_.increase_factor(ziel_w - band, tuning_or(tn.trend_horizon, 30.0f)),
+            tuning_or(tn.fan_increase_rate, 30.0f), 10.0f);
       }
       et_vorher = et;
       u = begrenze(u, u_min, u_grenze);
@@ -512,6 +526,12 @@ class VpdFallbackCore : public CoreBase {
         snprintf(zustand, sizeof(zustand), "%s", uebergang_aktiv ? tx.regulating_transition : tx.regulating);
     }
 
+    this->normal_output_ = u;
+    ausgang = this->protection_release_.apply(ausgang, u_sicher, auto_an && mess_ok,
+        tuning_or(tn.protection_release_rate, 20.0f), 10.0f);
+    if (auto_an && mess_ok && !offen && ausgang > std::max(u, u_sicher) + 0.01f)
+      snprintf(zustand, sizeof(zustand), "%s", tx.protection_recovery);
+
     // ---------- Ausgeben ----------
     ausgang = begrenze(par(ausgang, notlauf), 1.0f, 100.0f);
     if (!(fabsf(ausgang - aus_vorher) <= 0.01f)) {
@@ -522,7 +542,8 @@ class VpdFallbackCore : public CoreBase {
     this->fan_level = ausgang;
 
     // ---------- Schutz melden: eine Meldung je Episode (wie im Kalman-Regler) ----------
-    bool schutz[2] = {sich_t && auto_an, sich_rh && auto_an};
+    bool protection_enabled = auto_an || in.safety_in_manual;
+    bool schutz[2] = {sich_t && protection_enabled, sich_rh && protection_enabled};
     float s_wert[2] = {T, RH}, s_grenze[2] = {t_max, rh_max};
     const char *s_name[2] = {tx.prot_temp, tx.prot_rh};
     const char *s_einheit[2] = {tx.unit_temp, tx.unit_rh};
@@ -580,6 +601,7 @@ class VpdFallbackCore : public CoreBase {
       snprintf(buf, sizeof(buf), tx.log_reason_fmt, grund.c_str());
       loggen(buf);
     }
+    out.measured_vpd = measured_vpd;
     out.control_vpd = vpd;
     out.target_active = ziel_w;
     out.controller_output = u;

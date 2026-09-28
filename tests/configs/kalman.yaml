@@ -1,0 +1,25 @@
+packages:
+  base: !include base.yaml
+
+sensor:
+  - platform: template
+    id: room_t
+    lambda: return 22.0f;
+    update_interval: 10s
+  - platform: template
+    id: room_rh
+    lambda: return 50.0f;
+    update_interval: 10s
+
+vpd_kalman:
+  room_temperature: room_t
+  room_humidity: room_rh
+  measured_vpd:
+    name: Raw VPD
+  tuning:
+    control_smoothing: 10s
+    trend_horizon: 30s
+    fan_increase_rate: 30
+    protection_release_rate: 20
+  force_fallback:
+    name: Force fallback

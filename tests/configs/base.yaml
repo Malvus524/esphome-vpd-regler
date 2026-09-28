@@ -1,0 +1,46 @@
+esphome:
+  name: vpd-test
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: ../../components
+    components: [vpd_kalman]
+
+logger:
+
+output:
+  - platform: template
+    id: test_fan
+    type: float
+    write_action:
+      - lambda: '(void) state;'
+
+sensor:
+  - platform: template
+    id: tent_t
+    lambda: return 25.0f;
+    update_interval: 10s
+  - platform: template
+    id: tent_rh
+    lambda: return 60.0f;
+    update_interval: 10s
+
+vpd_kalman:
+  id: controller
+  output: test_fan
+  temperature: tent_t
+  humidity: tent_rh
+  sensor_timeout: 2min
+  safety_in_manual: true
+  state:
+    name: Controller state
+  fan_output:
+    name: Applied fan level
+  on_message:
+    - lambda: '(void) title; (void) message;'

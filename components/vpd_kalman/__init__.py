@@ -12,6 +12,7 @@ values, or number entities if they get a name.
 """
 
 import hashlib
+import math
 
 from esphome import automation
 import esphome.codegen as cg
@@ -65,6 +66,9 @@ CONF_CONTROLLER_OUTPUT = "controller_output"
 CONF_DAY = "day"
 CONF_NIGHT_KEY = "night"
 CONF_TUNING = "tuning"
+CONF_SENSOR_TIMEOUT = "sensor_timeout"
+CONF_SAFETY_IN_MANUAL = "safety_in_manual"
+CONF_LEARN_FAN_CURVE = "learn_fan_curve"
 
 # key: (default name, icon, unit, min, max, step, initial, entity category)
 NUMBERS = {
@@ -113,6 +117,10 @@ MODE_NUMBERS = SINGLE_TARGET | DAY_NIGHT_TARGET | SINGLE_LEAF_OFFSET | DAY_NIGHT
 
 # key: (default name, icon, unit, min, max, step, default)
 TUNING = {
+    "control_smoothing": ("Control VPD smoothing", "mdi:chart-bell-curve", "s", 0, 120, 1, 10),
+    "trend_horizon": ("VPD trend horizon", "mdi:trending-up", "s", 0, 120, 1, 30),
+    "fan_increase_rate": ("Fan increase limit", "mdi:speedometer", "%/min", 1, 600, 1, 30),
+    "protection_release_rate": ("Protection release rate", "mdi:fan", "%/min", 1, 100, 1, 20),
     # Switching Kalman <-> fallback when a configured room sensor fails
     "room_fallback_delay": ("Room sensor fallback delay", "mdi:timer-alert-outline", "min", 0.5, 60, 0.5, 2),
     "room_return_delay": ("Room sensor return delay", "mdi:timer-check-outline", "min", 0.5, 60, 0.5, 1),
@@ -155,6 +163,7 @@ CONF_FORCE_FALLBACK = "force_fallback"
 
 # key: (icon, unit, accuracy, state class, entity category) - all optional
 SENSORS = {
+    "measured_vpd": ("mdi:target-variant", "kPa", 3, STATE_CLASS_MEASUREMENT, ENTITY_CATEGORY_DIAGNOSTIC),
     "control_vpd": ("mdi:target-variant", "kPa", 3, None, None),
     "target_active": ("mdi:target", "kPa", 2, None, ENTITY_CATEGORY_DIAGNOSTIC),
     "controller_output": ("mdi:fan", "%", 1, STATE_CLASS_MEASUREMENT, ENTITY_CATEGORY_DIAGNOSTIC),
@@ -180,7 +189,7 @@ SENSORS = {
 # Only used by the Kalman controller: not created (numbers) or rejected
 # (sensors, tuning) when no room sensor is configured
 KALMAN_ONLY = {
-    "vpd_sacrifice", "speed",
+    "vpd_sacrifice", "speed", "control_smoothing",
     "excess", "excess_target", "moisture_load", "next_step_benefit", "vpd_at_max",
     "learned_airflow_50", "learned_sensor_offset", "learned_sensor_lag", "learned_sensible_max", "fan_curve_learned",
     "room_fallback_delay", "room_return_delay", "light_memory_after", "light_memory_delay",
@@ -197,6 +206,26 @@ BINARY_SENSORS = {
 }
 
 
+def _finite_float(value):
+    value = cv.float_(value)
+    if not math.isfinite(value):
+        raise cv.Invalid("must be finite")
+    return value
+
+
+def _number_limits(config, lo, hi):
+    low = config[CONF_MIN_VALUE]
+    high = config[CONF_MAX_VALUE]
+    initial = config[CONF_INITIAL_VALUE]
+    if not lo <= low < high <= hi:
+        raise cv.Invalid(f"min_value < max_value must be within {lo}..{hi}")
+    if not low <= initial <= high:
+        raise cv.Invalid("initial_value must be within min_value..max_value", path=[CONF_INITIAL_VALUE])
+    if not 0 < config[CONF_STEP] <= high - low:
+        raise cv.Invalid("step must be positive and no larger than the range", path=[CONF_STEP])
+    return config
+
+
 def _number_schema(key):
     name, icon, unit, lo, hi, step, initial, category = NUMBERS[key]
     kwargs = {"icon": icon}
@@ -206,13 +235,14 @@ def _number_schema(key):
         kwargs["entity_category"] = category
     schema = number.number_schema(VpdNumber, **kwargs).extend(
         {
-            cv.Optional(CONF_MIN_VALUE, default=lo): cv.float_,
-            cv.Optional(CONF_MAX_VALUE, default=hi): cv.float_,
-            cv.Optional(CONF_STEP, default=step): cv.positive_float,
-            cv.Optional(CONF_INITIAL_VALUE, default=initial): cv.float_,
+            cv.Optional(CONF_MIN_VALUE, default=lo): _finite_float,
+            cv.Optional(CONF_MAX_VALUE, default=hi): _finite_float,
+            cv.Optional(CONF_STEP, default=step): cv.All(_finite_float, cv.positive_float),
+            cv.Optional(CONF_INITIAL_VALUE, default=initial): _finite_float,
             cv.Optional(CONF_MODE, default="BOX"): cv.enum(number.NUMBER_MODES, upper=True),
         }
     )
+    schema = cv.All(schema, lambda config: _number_limits(config, lo, hi))
     if key in MODE_NUMBERS:
         # Default name added in _check_night if the mode needs it
         return cv.Optional(key), _with_default_name(schema, name)
@@ -253,14 +283,15 @@ def _tuning_schema(key):
         kwargs["unit_of_measurement"] = unit
     entity = number.number_schema(VpdNumber, **kwargs).extend(
         {
-            cv.Optional(CONF_MIN_VALUE, default=lo): cv.float_,
-            cv.Optional(CONF_MAX_VALUE, default=hi): cv.float_,
-            cv.Optional(CONF_STEP, default=step): cv.positive_float,
-            cv.Optional(CONF_INITIAL_VALUE, default=default): cv.float_,
+            cv.Optional(CONF_MIN_VALUE, default=lo): _finite_float,
+            cv.Optional(CONF_MAX_VALUE, default=hi): _finite_float,
+            cv.Optional(CONF_STEP, default=step): cv.All(_finite_float, cv.positive_float),
+            cv.Optional(CONF_INITIAL_VALUE, default=default): _finite_float,
             cv.Optional(CONF_MODE, default="BOX"): cv.enum(number.NUMBER_MODES, upper=True),
         }
     )
-    in_range = cv.float_range(min=lo, max=hi)
+    entity = cv.All(entity, lambda config: _number_limits(config, lo, hi))
+    in_range = cv.All(_finite_float, cv.float_range(min=lo, max=hi))
 
     def validate(value):
         if isinstance(value, dict):
@@ -270,7 +301,7 @@ def _tuning_schema(key):
             try:
                 value = float(value)
             except ValueError:
-                ms = cv.positive_time_period_milliseconds(value).total_milliseconds
+                ms = cv.time_period(value).total_milliseconds
                 value = ms / (60000.0 if unit == "min" else 1000.0)
         return in_range(value)
 
@@ -301,9 +332,16 @@ _schema = {
     cv.Optional(CONF_ROOM_HUMIDITY): cv.use_id(sensor.Sensor),
     cv.Optional(CONF_EXTERNAL_CLIMATE): cv.returning_lambda,
     cv.Optional(CONF_LANGUAGE, default="en"): cv.enum(LANGUAGES, lower=True),
-    cv.Optional(CONF_AIRFLOW_AT_ZERO, default=0.2): cv.float_range(min=0.0, max=0.95),
-    cv.Optional(CONF_TIME_CONSTANT, default="21s"): cv.positive_time_period_milliseconds,
-    cv.Optional(CONF_LEAF_MAX_DEVIATION, default=6.0): cv.positive_float,
+    cv.Optional(CONF_AIRFLOW_AT_ZERO, default=0.2): cv.All(_finite_float, cv.float_range(min=0.0, max=0.95)),
+    cv.Optional(CONF_TIME_CONSTANT, default="21s"): cv.All(
+        cv.positive_time_period_milliseconds, cv.Range(min=cv.TimePeriod(seconds=10), max=cv.TimePeriod(hours=1))
+    ),
+    cv.Optional(CONF_SENSOR_TIMEOUT, default="2min"): cv.All(
+        cv.positive_time_period_milliseconds, cv.Range(min=cv.TimePeriod(seconds=10), max=cv.TimePeriod(hours=24))
+    ),
+    cv.Optional(CONF_SAFETY_IN_MANUAL, default=True): cv.boolean,
+    cv.Optional(CONF_LEARN_FAN_CURVE, default=False): cv.boolean,
+    cv.Optional(CONF_LEAF_MAX_DEVIATION, default=6.0): cv.All(_finite_float, cv.positive_float),
     cv.Optional(CONF_STORAGE_KEYS, default={}): STORAGE_KEYS_SCHEMA,
     cv.Optional(CONF_TUNING, default={}): cv.Schema(dict(_tuning_schema(k) for k in TUNING)),
     cv.Optional(CONF_ON_MESSAGE): automation.validate_automation({}),
@@ -394,11 +432,27 @@ def _check_mode(config):
     return config
 
 
+def _check_limits(config):
+    if config["fan_min"][CONF_INITIAL_VALUE] > config["fan_max"][CONF_INITIAL_VALUE]:
+        raise cv.Invalid("fan_min initial_value must not exceed fan_max initial_value", path=["fan_min"])
+    if config[CONF_LEARN_FAN_CURVE] and _is_fallback(config):
+        raise cv.Invalid("learn_fan_curve needs room_temperature and room_humidity", path=[CONF_LEARN_FAN_CURVE])
+    learning_diagnostics = {
+        "learned_airflow_50", "learned_sensor_offset", "learned_sensor_lag",
+        "learned_sensible_max", "fan_curve_learned",
+    }
+    for key in learning_diagnostics:
+        if key in config and not config[CONF_LEARN_FAN_CURVE]:
+            raise cv.Invalid(f"'{key}' needs learn_fan_curve: true", path=[key])
+    return config
+
+
 CONFIG_SCHEMA = cv.All(
     cv.Schema(_schema).extend(cv.COMPONENT_SCHEMA),
     cv.has_none_or_all_keys(CONF_ROOM_TEMPERATURE, CONF_ROOM_HUMIDITY),
     _check_night,
     _check_mode,
+    _check_limits,
 )
 
 
@@ -406,6 +460,10 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
+    cg.add(var.set_sensor_timeout(config[CONF_SENSOR_TIMEOUT]))
+    cg.add(var.set_safety_in_manual(config[CONF_SAFETY_IN_MANUAL]))
+    if config[CONF_LEARN_FAN_CURVE]:
+        cg.add_define("USE_VPD_FAN_CURVE")
     cg.add(var.set_output(await cg.get_variable(config[CONF_OUTPUT])))
     if CONF_NIGHT in config:
         cg.add(var.set_night(await cg.get_variable(config[CONF_NIGHT])))

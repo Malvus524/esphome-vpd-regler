@@ -78,7 +78,11 @@
 #include <string>
 #include <vector>
 
+#include "vpd_input.h"
+#include "vpd_control_support.h"
+#ifdef USE_VPD_FAN_CURVE
 #include "vpd_fan_curve.h"
+#endif
 
 namespace esphome {
 namespace vpd_kalman {
@@ -90,7 +94,7 @@ struct Texts {
   // State text sensor
   const char *manual, *waiting, *tent_sensor_error, *room_missing, *tent_open_fmt, *safety_fmt, *safety_temp,
       *safety_rh, *in_band_transition, *in_band, *at_max, *unreachable, *at_min, *regulating_transition,
-      *regulating;
+      *regulating, *protection_recovery;
   // Log lines ("reason" of the last event)
   const char *log_state_fmt, *log_reason_fmt, *r_restart, *r_source_ext, *r_source_ext_missing, *r_source_own,
       *r_control_on, *r_control_off, *r_open, *r_closed, *r_lights_off, *r_lights_on;
@@ -104,7 +108,7 @@ static const Texts TEXTS[2] = {
         // ---------------- English ----------------
         "Manual", "Waiting for sensors", "Tent sensor error", "Room sensor missing - fan held",
         "Tent open - paused (%d min)", "Safety (%s)", "temperature", "humidity", "In band (transition)", "In band",
-        "At sensible maximum", "Target unreachable", "At fan minimum", "Regulating (transition)", "Regulating",
+        "At sensible maximum", "Target unreachable", "At fan minimum", "Regulating (transition)", "Regulating", "Protection recovery",
         //
         "State: %s", "Reason: %s", "Restart", "Tent sensor: external", "External tent sensor missing - using own",
         "Tent sensor: own", "Control switched on", "Control switched off", "Tent open - controller paused",
@@ -119,7 +123,7 @@ static const Texts TEXTS[2] = {
         // ---------------- Deutsch ----------------
         "Hand", "Warte auf Sensoren", "Sensorfehler Zelt", "Raumsensor fehlt - Lüfter gehalten",
         "Zelt offen - pausiert (%d min)", "Sicherheit (%s)", "Temperatur", "Feuchte", "Im Band (Übergang)", "Im Band",
-        "An sinnvollem Maximum", "Ziel unerreichbar", "An Lüfter min", "Regeln (Übergang)", "Regeln",
+        "An sinnvollem Maximum", "Ziel unerreichbar", "An Lüfter min", "Regeln (Übergang)", "Regeln", "Rueckkehr nach Schutz",
         //
         "Zustand: %s", "Grund: %s", "Neustart", "Regelsensor: unten", "Sensor unten fehlt - Ersatz oben",
         "Regelsensor: oben", "Regelung eingeschaltet", "Regelung ausgeschaltet", "Zelt offen - Regler pausiert",
@@ -133,12 +137,14 @@ static const Texts TEXTS[2] = {
 
 // Tent climate from an external source (e.g. a second sensor via radio).
 // NAN in any field = not available, the controller then uses its own
-// sensors. selected only decides the log text of a source change.
+// sensors. selected enables this source; sample_age_ms is the age of the
+// oldest value in the packet, supplied by the receiver (not by this loop).
 struct ExternalClimate {
   bool selected{false};
   float temperature{NAN};
   float humidity{NAN};
   float leaf_temperature{NAN};
+  uint32_t sample_age_ms{UINT32_MAX};
 };
 
 // Optional tuning parameters, in the unit of their entity. NAN = default.
@@ -168,6 +174,10 @@ struct Tuning {
   float fallback_smoothing{NAN};     // s
   float limit_test_margin{NAN};      // kPa
   float limit_test_max_pause{NAN};   // min
+  float control_smoothing{NAN};      // s, Kalman control signal low-pass time constant
+  float trend_horizon{NAN};          // s, maximum lookahead for an improving VPD
+  float fan_increase_rate{NAN};      // percentage points/min, regular feedback corrections
+  float protection_release_rate{NAN}; // percentage points/min, automatic recovery
 };
 
 enum TuningKey : uint8_t {
@@ -190,6 +200,10 @@ enum TuningKey : uint8_t {
   TUNING_FALLBACK_SMOOTHING,
   TUNING_LIMIT_TEST_MARGIN,
   TUNING_LIMIT_TEST_MAX_PAUSE,
+  TUNING_CONTROL_SMOOTHING,
+  TUNING_TREND_HORIZON,
+  TUNING_FAN_INCREASE_RATE,
+  TUNING_PROTECTION_RELEASE_RATE,
   TUNING_COUNT,
 };
 
@@ -201,14 +215,15 @@ static float Tuning::*const TUNING_FIELDS[TUNING_COUNT] = {
     &Tuning::temperature_hysteresis, &Tuning::humidity_hysteresis,    &Tuning::all_clear_after,
     &Tuning::fallback_time_constant, &Tuning::fallback_rate,          &Tuning::limit_finder_cost,
     &Tuning::limit_finder_step,      &Tuning::fallback_smoothing,     &Tuning::limit_test_margin,
-    &Tuning::limit_test_max_pause,
+    &Tuning::limit_test_max_pause, &Tuning::control_smoothing, &Tuning::trend_horizon,
+    &Tuning::fan_increase_rate, &Tuning::protection_release_rate,
 };
 
 // Tuning value or default
-inline float tuning_or(float v, float def) { return std::isnan(v) ? def : v; }
+inline float tuning_or(float v, float def) { return !std::isfinite(v) ? def : v; }
 // Tuning value converted to ticks (ticks_per_unit), at least lo, or default
 inline int tuning_ticks(float v, float ticks_per_unit, int def, int lo = 1) {
-  return std::isnan(v) ? def : std::max(lo, (int) lroundf(v * ticks_per_unit));
+  return !std::isfinite(v) ? def : std::max(lo, (int) lroundf(v * ticks_per_unit));
 }
 
 struct Inputs {
@@ -224,6 +239,8 @@ struct Inputs {
   float room_t{NAN}, room_rh{NAN};
   // Switches
   bool auto_on{false};
+  bool safety_in_manual{true};
+  uint32_t sensor_timeout_ms{120000};
   bool tent_open{false};
   bool force_fallback{false};   // switch "use fallback controller" (VpdControllerCore)
   // Settings (number entities)
@@ -247,6 +264,7 @@ struct Event {
 struct Outputs {
   std::vector<Event> events;
   // Diagnostics, published every tick (NAN = unknown)
+  float measured_vpd{NAN};  // unfiltered, for comparison with the actual control signal
   float control_vpd{NAN}, target_active{NAN}, controller_output{NAN}, sensible_max{NAN}, fan_output{NAN},
       excess{NAN}, excess_target{NAN}, moisture_load{NAN}, next_step_benefit{NAN}, vpd_at_max{NAN};
   // Fan curve learning (Kalman only): airflow at 50 % fan in % of full,
@@ -285,7 +303,8 @@ class CoreBase {
   // Manual speed changed. Returns false in automatic (nothing to do).
   bool manual_level(bool auto_on, float x, float &level) {
     if (auto_on) return false;
-    level = x;
+    this->protection_release_.reset();
+    level = std::max(std::isfinite(x) ? x : 50.0f, this->manual_safety_floor_);
     // Failsafe: never switch off, catch broken values
     if (std::isnan(level) || level < 1.0f) level = 1.0f;
     if (level > 100.0f) level = 100.0f;
@@ -294,7 +313,8 @@ class CoreBase {
   }
   // Control switched off: back to the manual speed.
   float control_off_level(float manual) {
-    float level = manual;
+    this->protection_release_.reset();
+    float level = std::max(std::isfinite(manual) ? manual : 50.0f, this->manual_safety_floor_);
     if (std::isnan(level) || level < 1.0f) level = 1.0f;
     if (level > 100.0f) level = 100.0f;
     this->fan_level = level;
@@ -302,6 +322,15 @@ class CoreBase {
   }
 
  protected:
+  float manual_safety_floor_{0.0f};
+  Median3 vpd_median_;
+  VpdResponse vpd_response_;
+  ProtectionRelease protection_release_;
+  float normal_output_{NAN};
+  float handover_level_() const {
+    return std::isfinite(this->normal_output_) && this->protection_release_.above(this->normal_output_)
+               ? this->normal_output_ : this->fan_level;
+  }
   // ---------- Event memory (was "static" in the lambdas) ----------
   bool auto_vorher = false, nacht_vorher = false;
   bool nacht_bekannt = false;       // Nachtphase hat schon einen Wert
@@ -327,16 +356,22 @@ class VpdKalmanCore : public CoreBase {
   }
   void set_airflow_at_zero(float q0) {
     this->q0_ = q0;
+#ifdef USE_VPD_FAN_CURVE
     this->bank_.set_config(this->q0_, this->tau_s_);
+#endif
   }
   void set_time_constant_s(float s) {
     this->tau_s_ = s;
+#ifdef USE_VPD_FAN_CURVE
     this->bank_.set_config(this->q0_, this->tau_s_);
+#endif
   }
+#ifdef USE_VPD_FAN_CURVE
   /// Learn the fan curve (vpd_fan_curve.h). Off by default so that host
   /// tests can compare the controller bit by bit, the ESPHome glue turns it on.
   void set_fan_curve_learning(bool on) { this->learn_curve_ = on; }
   FanCurveBank &fan_curve() { return this->bank_; }
+#endif
   void set_leaf_max_deviation(float d) { this->leaf_max_dev_ = d; }
 
   /// Current sensible maximum in % (NAN = not known yet).
@@ -349,22 +384,28 @@ class VpdKalmanCore : public CoreBase {
   // more uncertainty. light_changed: there was a light change meanwhile, so
   // remembering starts over.
   void take_over(const Inputs &in, bool light_changed, const std::string &reason) {
-    auto par = [](float v, float def) { return std::isnan(v) ? def : v; };
-    float u_min = par(in.fan_min, 5.0f);
-    float u_max = std::max(par(in.fan_max, 100.0f), u_min);
+    auto par = [](float v, float def) { return !std::isfinite(v) ? def : v; };
+    float u_max = std::min(100.0f, std::max(1.0f, par(in.fan_max, 100.0f)));
+    float u_min = std::min(u_max, std::max(1.0f, par(in.fan_min, 5.0f)));
     if (!gestartet) {
       gestartet = true;
       u_phase[0] = this->saved_u_day;
       u_phase[1] = this->saved_u_night;
     }
-    u = std::min(std::max(this->fan_level, u_min), u_max);
+    u = std::min(std::max(this->handover_level_(), u_min), u_max);
     if (!std::isnan(u_max_s)) u_max_s = std::max(u_max_s, u);
     if (light_changed) t_phase = 0;
     u_kand = -1.0f; t_kand = 0;
     kalman_neu = true; e_neu = false;
+    this->vpd_median_.reset();
+    this->vpd_response_.reset();
     ziel_eff = NAN; fuehr_starten = false;
     zustand_vorher.clear();
     grund = reason;
+    previous_target_ = par(in.night_has_state && in.night ? in.target_night : in.target_day, 1.0f);
+#ifdef USE_VPD_FAN_CURVE
+    this->bank_.resume();
+#endif
   }
 
   // ---------- One control tick (10 s) ----------
@@ -399,7 +440,7 @@ class VpdKalmanCore : public CoreBase {
     const float tau_voll = this->tau_s_ / 60.0f;       // min, Zeitkonstante bei 100 %
 
     // ---------- Einstellwerte ----------
-    auto par = [](float v, float def) { return std::isnan(v) ? def : v; };
+    auto par = [](float v, float def) { return !std::isfinite(v) ? def : v; };
     auto begrenze = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
     bool nacht = in.night_has_state ? in.night : nacht_vorher;
     float ziel    = par(nacht ? in.target_night : in.target_day, 1.0f);
@@ -408,9 +449,9 @@ class VpdKalmanCore : public CoreBase {
     float tempo   = begrenze(par(in.speed, 0.25f), 0.05f, 1.0f);
     float uebergang = begrenze(par(in.transition, 45.0f), 0.0f, 180.0f);
     float offen_max = begrenze(par(in.open_max, 30.0f), 5.0f, 240.0f);
-    float u_min   = par(in.fan_min, 5.0f);
-    float u_max   = std::max(par(in.fan_max, 100.0f), u_min);
-    float notlauf = par(in.emergency, 40.0f);
+    float u_max   = begrenze(par(in.fan_max, 100.0f), 1.0f, 100.0f);
+    float u_min   = begrenze(par(in.fan_min, 5.0f), 1.0f, u_max);
+    float notlauf = begrenze(par(in.emergency, 40.0f), 1.0f, 100.0f);
     float t_max   = par(in.temp_max, 28.0f);
     float t_band  = std::max(par(in.temp_band, 3.0f), 0.5f);
     float rh_max  = par(in.rh_max, 75.0f);
@@ -435,8 +476,10 @@ class VpdKalmanCore : public CoreBase {
     // Sensor: Blatttemperatur vom Blattsensor (Schalter AN, plausibel),
     // sonst Zelttemperatur + Blatt-Offset Tag/Nacht.
     bool unten_gewaehlt = in.ext.selected;
-    bool unten = unten_gewaehlt && !std::isnan(in.ext.temperature) &&
-                 !std::isnan(in.ext.humidity) && !std::isnan(in.ext.leaf_temperature);
+    bool unten = unten_gewaehlt && valid_climate(in.ext.temperature, in.ext.humidity) &&
+                 valid_temperature(in.ext.leaf_temperature) &&
+                 fabsf(in.ext.leaf_temperature - in.ext.temperature) <= this->leaf_max_dev_ &&
+                 in.ext.sample_age_ms < in.sensor_timeout_ms;
     float T, RH, T_blatt;
     if (unten) {
       T = in.ext.temperature; RH = in.ext.humidity; T_blatt = in.ext.leaf_temperature;
@@ -444,14 +487,21 @@ class VpdKalmanCore : public CoreBase {
       T = in.t; RH = in.rh;
       float offset = par(nacht ? in.leaf_offset_night : in.leaf_offset_day, -2.0f);
       float mlx = in.leaf;
-      T_blatt = (in.leaf_switch && !std::isnan(mlx) &&
+      T_blatt = (in.leaf_switch && valid_temperature(mlx) &&
                  fabsf(mlx - T) <= this->leaf_max_dev_) ? mlx : T + offset;
     }
     float Tr = in.room_t, RHr = in.room_rh;
-    bool zelt_ok = !std::isnan(T) && !std::isnan(RH) && !std::isnan(T_blatt);
+    bool zelt_ok = valid_climate(T, RH) && valid_temperature(T_blatt);
     // Regelgroesse zur Anzeige (Regelung rechnet unten gleich mit E)
     float vpd_regel_anz = zelt_ok ? svp(T_blatt) - svp(T) * RH / 100.0f : NAN;
-    bool raum_ok = !std::isnan(Tr) && !std::isnan(RHr);
+    bool raum_ok = valid_climate(Tr, RHr);
+    const bool signal_reset = !zelt_ok || in.tent_open ||
+        (quelle_vorher >= 0 && quelle_vorher != (int) unten) ||
+        (nacht_bekannt && nacht != nacht_vorher) || (offen_vorher && !in.tent_open);
+    if (signal_reset) { this->vpd_median_.reset(); this->vpd_response_.reset(); }
+    const float filtered_vpd = zelt_ok
+        ? this->vpd_response_.update(this->vpd_median_.update(vpd_regel_anz), 10.0f,
+                                     tuning_or(tn.control_smoothing, 10.0f)) : NAN;
     bool auto_an = in.auto_on;
     float aus_vorher = this->fan_level;
     if (zelt_ok) zelt_je_ok = true;
@@ -471,17 +521,11 @@ class VpdKalmanCore : public CoreBase {
     // Ueber der Schwelle sofort mindestens Notlauf, dann linear ueber
     // das P-Band bis 100 %. Aus erst wieder unter Schwelle - Hysterese,
     // sonst flattert der Ausgang, wenn der Messwert um die Schwelle pendelt.
-    auto sicherheit = [&](float wert, float schwelle, float p_band, float hyst, bool &aktiv) -> float {
-      if (std::isnan(wert)) { aktiv = false; return 0.0f; }
-      if (wert > schwelle) aktiv = true;
-      else if (wert < schwelle - hyst) aktiv = false;
-      if (!aktiv) return 0.0f;
-      return begrenze(notlauf + (100.0f - notlauf) * std::max(wert - schwelle, 0.0f) / p_band,
-                      0.0f, 100.0f);
-    };
-    float u_temp = sicherheit(T, t_max, t_band, T_HYST, sich_t);
-    float u_rh = sicherheit(RH, rh_max, rh_band, RH_HYST, sich_rh);
+    float u_temp = protection_output(valid_temperature(T) ? T : NAN, t_max, t_band, T_HYST, notlauf, sich_t);
+    float u_rh = protection_output(valid_humidity(RH) ? RH : NAN, rh_max, rh_band, RH_HYST, notlauf, sich_rh);
     float u_sicher = std::max(u_temp, u_rh);
+    this->manual_safety_floor_ = in.safety_in_manual
+        ? std::max(u_sicher, zelt_ok ? 0.0f : notlauf) : 0.0f;
 
     // ---------- Start und Hand/Automatik ----------
     if (!gestartet) {
@@ -554,6 +598,10 @@ class VpdKalmanCore : public CoreBase {
       grund = nacht ? tx.r_lights_off : tx.r_lights_on;
     }
 
+    if (std::isfinite(this->previous_target_) && fabsf(ziel - this->previous_target_) > 0.0005f)
+      fuehr_starten = true;
+    this->previous_target_ = ziel;
+
     // ---------- 2. Umrechnen und 4. Kalman-Filter ----------
     float e_zelt = NAN, e_raum = NAN, e_mess = NAN;
     if (zelt_ok && raum_ok) {
@@ -563,12 +611,14 @@ class VpdKalmanCore : public CoreBase {
     }
     // Kennlinien-Bank: lernt immer mit dem eigenen Zeltsensor (die Kennlinie
     // gehoert zum Luefter, Versatz und Traegheit zu diesem Sensor)
+#ifdef USE_VPD_FAN_CURVE
     if (this->learn_curve_) {
-      bool eigen_ok = !std::isnan(in.t) && !std::isnan(in.rh) && raum_ok;
+      bool eigen_ok = valid_climate(in.t, in.rh) && raum_ok;
       float c_eigen = eigen_ok ? svp(in.t) / 100.0f : NAN;
       this->bank_.step(eigen_ok, eigen_ok ? c_eigen * in.rh : NAN, eigen_ok ? svp(Tr) * RHr / 100.0f : NAN,
                        c_eigen, aus_vorher, licht_jetzt, offen, L_REL_H, R_MESS);
     }
+#endif
     // Bei offenem Zelt gilt E = L/q nicht (Luft geht nicht nur durch den
     // Luefter) - Filter und sinnvolles Maximum pausieren.
     if (!std::isnan(e_mess) && !offen) {
@@ -618,10 +668,12 @@ class VpdKalmanCore : public CoreBase {
 
       // ---------- 5. Sinnvolles Maximum (laufend, in jeder Betriebsart) ----------
       // Mit gelernter Kennlinie, sobald die Bank klar besser vorhersagt
-      float ziel_max = (this->learn_curve_ && this->bank_.active())
-          ? this->bank_.sensible_max(verzicht, u_max)
-          : verzicht > 0.0f
+      float ziel_max = verzicht > 0.0f
           ? u_von(1.0f / (verzicht / kl + 1.0f / q_von(u_max))) : u_max;
+#ifdef USE_VPD_FAN_CURVE
+      if (this->learn_curve_ && this->bank_.active())
+        ziel_max = this->bank_.sensible_max(verzicht, u_max);
+#endif
       ziel_max = begrenze(ziel_max, u_min, u_max);
       if (std::isnan(u_max_s)) u_max_s = ziel_max;   // erster Wert direkt
       u_max_s += begrenze(ziel_max - u_max_s, -MAX_RATE * DT, MAX_RATE * DT);
@@ -635,9 +687,14 @@ class VpdKalmanCore : public CoreBase {
     char zustand[48];
     if (!auto_an) {
       // ================= HAND =================
-      ausgang = par(in.manual_speed, 50.0f);
+      ausgang = std::max(par(in.manual_speed, 50.0f), this->manual_safety_floor_);
       fuehr_starten = false; ziel_eff = NAN;  // kein alter Übergang beim Einschalten
-      snprintf(zustand, sizeof(zustand), "%s", tx.manual);
+      if (in.safety_in_manual && !zelt_ok)
+        snprintf(zustand, sizeof(zustand), "%s", tx.tent_sensor_error);
+      else if (in.safety_in_manual && u_sicher > par(in.manual_speed, 50.0f))
+        snprintf(zustand, sizeof(zustand), tx.safety_fmt, u_temp >= u_rh ? tx.safety_temp : tx.safety_rh);
+      else
+        snprintf(zustand, sizeof(zustand), "%s", tx.manual);
 
     } else if ((!zelt_ok && !zelt_je_ok && t_boot < BOOT_WARTEN) ||
                (zelt_ok && !nacht_bekannt && t_boot < BOOT_WARTEN_NACHT)) {
@@ -662,9 +719,9 @@ class VpdKalmanCore : public CoreBase {
 
     } else {
       float q = q_von(u);
-      bool sicher = u_sicher > u + 1.0f;
+      bool sicher = u_sicher > u + 1.0f || this->protection_release_.above(u);
       float e_blatt = svp(T_blatt);
-      float vpd_regel = e_blatt - e_zelt;
+      float vpd_regel = filtered_vpd;
 
       // ---------- 6. Soll mit Sollwert-Übergang ----------
       if (fuehr_starten) {
@@ -691,6 +748,7 @@ class VpdKalmanCore : public CoreBase {
       // Ueberschuss, bei dem mit der Blatttemperatur ein bestimmter VPD herauskommt
       auto e_fuer = [&](float v) { return e_blatt - v - e_raum; };
       e_wahr = e_zelt - e_raum;
+      const float e_regel = e_blatt - vpd_regel - e_raum;
       e_soll = e_fuer(ziel_w);
       float e_oben = e_fuer(ziel_w - band);    // feuchter darf es nicht werden
       float e_unten = e_fuer(ziel_w + band);   // trockener darf es nicht werden
@@ -705,14 +763,17 @@ class VpdKalmanCore : public CoreBase {
       // ln(E / Bandrand), darunter stetig weiter statt eines Sprungs.
       float fehler = 0.0f;
       if (vpd_regel < ziel_w - band)          // zu feucht -> mehr Luefter
-        fehler = std::max(log1pf((e_wahr - e_oben) / std::max(e_oben, E_KLEIN)), 0.0f);
+        fehler = std::max(log1pf((e_regel - e_oben) / std::max(e_oben, E_KLEIN)), 0.0f);
       else if (vpd_regel > ziel_w + band)     // zu trocken -> weniger
-        fehler = std::min(-log1pf((e_unten - e_wahr) / std::max(e_wahr, E_KLEIN)), 0.0f);
+        fehler = std::min(-log1pf((e_unten - e_regel) / std::max(e_regel, E_KLEIN)), 0.0f);
       fehler = begrenze(fehler, -F_MAX, F_MAX);
       bool im_band = fehler == 0.0f;
       if (!sicher && !im_band) {
         float k = tempo * q / tau_voll;      // Tempo folgt dem Luftwechsel
-        u = u_von(q * expf(k * DT * fehler));
+        const float requested = u_von(q * expf(k * DT * fehler));
+        u = limit_fan_increase(u, requested,
+            this->vpd_response_.increase_factor(ziel_w - band, tuning_or(tn.trend_horizon, 30.0f)),
+            tuning_or(tn.fan_increase_rate, 30.0f), 10.0f);
       }
 
       // ---------- 8. Begrenzen ----------
@@ -740,6 +801,14 @@ class VpdKalmanCore : public CoreBase {
         snprintf(zustand, sizeof(zustand), "%s", uebergang_aktiv ? tx.regulating_transition : tx.regulating);
     }
 
+    // Release only the extra protection output gradually. Sensor failure and
+    // explicit manual operation retain their own immediate output policies.
+    this->normal_output_ = u;
+    ausgang = this->protection_release_.apply(ausgang, u_sicher, auto_an && zelt_ok,
+        tuning_or(tn.protection_release_rate, 20.0f), 10.0f);
+    if (auto_an && zelt_ok && raum_ok && !offen && ausgang > std::max(u, u_sicher) + 0.01f)
+      snprintf(zustand, sizeof(zustand), "%s", tx.protection_recovery);
+
     // ---------- 10. Ausgeben ----------
     ausgang = begrenze(par(ausgang, notlauf), 1.0f, 100.0f);
     if (!(fabsf(ausgang - aus_vorher) <= 0.01f)) {
@@ -750,8 +819,9 @@ class VpdKalmanCore : public CoreBase {
     this->fan_level = ausgang;
 
     // ---------- Schutz melden: eine Meldung je Episode ----------
-    // Im Handbetrieb greift die Sicherheit nicht ein, also auch keine Meldung.
-    bool schutz[2] = {sich_t && auto_an, sich_rh && auto_an};
+    // Protection can also override manual operation.
+    bool protection_enabled = auto_an || in.safety_in_manual;
+    bool schutz[2] = {sich_t && protection_enabled, sich_rh && protection_enabled};
     float s_wert[2] = {T, RH}, s_grenze[2] = {t_max, rh_max};
     const char *s_name[2] = {tx.prot_temp, tx.prot_rh};
     const char *s_einheit[2] = {tx.unit_temp, tx.unit_rh};
@@ -817,7 +887,8 @@ class VpdKalmanCore : public CoreBase {
       l.a = buf;
       out.events.push_back(std::move(l));
     }
-    out.control_vpd = vpd_regel_anz;
+    out.measured_vpd = vpd_regel_anz;
+    out.control_vpd = filtered_vpd;
     out.target_active = ziel_w;
     out.controller_output = u;
     out.sensible_max = u_max_s;
@@ -827,6 +898,7 @@ class VpdKalmanCore : public CoreBase {
     out.moisture_load = kl;
     out.next_step_benefit = nutzen;
     out.vpd_at_max = vpd_max;
+#ifdef USE_VPD_FAN_CURVE
     if (this->learn_curve_) {
       out.learned_airflow_50 = 100.0f * this->bank_.airflow(50.0f);
       out.learned_offset = this->bank_.offset();
@@ -834,6 +906,7 @@ class VpdKalmanCore : public CoreBase {
       out.learned_sensible_max = begrenze(this->bank_.sensible_max(verzicht, u_max), u_min, u_max);
       out.fan_curve_active = this->bank_.active();
     }
+#endif
   }
 
  protected:
@@ -841,8 +914,11 @@ class VpdKalmanCore : public CoreBase {
   float q0_{0.2f};
   float tau_s_{21.0f};
   float leaf_max_dev_{6.0f};
+#ifdef USE_VPD_FAN_CURVE
   bool learn_curve_{false};
   FanCurveBank bank_;
+#endif
+  float previous_target_{NAN};
 
   // ---------- Speicher (war "static" im Lambda, gemeinsamer Teil in CoreBase) ----------
   bool gestartet = false;

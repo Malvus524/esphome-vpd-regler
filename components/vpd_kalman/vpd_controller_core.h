@@ -62,6 +62,8 @@ class VpdControllerCore {
 
   // ---------- One control tick (10 s) ----------
   void step(const Inputs &in, Outputs &out) {
+    out.learned_airflow_50 = out.learned_offset = out.learned_lag = out.learned_sensible_max = NAN;
+    out.fan_curve_active = false;
     if (!this->room_configured_) {
       this->fallback.step(in, out);
       out.fallback_active = true;
@@ -74,7 +76,7 @@ class VpdControllerCore {
     const int WEG_TAKTE = tuning_ticks(tn.room_fallback_delay, 6.0f, 12);      // 2 min ohne Raumwert
     const int ZURUECK_TAKTE = tuning_ticks(tn.room_return_delay, 6.0f, 6);     // 1 min mit Raumwerten
 
-    bool raum_ok = !std::isnan(in.room_t) && !std::isnan(in.room_rh);
+    bool raum_ok = valid_climate(in.room_t, in.room_rh);
     bool erzwungen_vorher = this->erzwungen_;
     bool melden = false;
     char buf[200];

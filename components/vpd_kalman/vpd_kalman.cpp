@@ -14,13 +14,16 @@ static const char *const TAG = "vpd";
 void VpdNumber::setup() {
   float value;
   this->pref_ = this->make_entity_preference<float>();
-  if (!this->pref_.load(&value)) {
-    value = std::isnan(this->initial_value_) ? this->traits.get_min_value() : this->initial_value_;
+  if (!this->pref_.load(&value) || !std::isfinite(value)) {
+    value = !std::isfinite(this->initial_value_) ? this->traits.get_min_value() : this->initial_value_;
   }
+  value = std::min(this->traits.get_max_value(), std::max(this->traits.get_min_value(), value));
   this->publish_state(value);
 }
 
 void VpdNumber::control(float value) {
+  if (!std::isfinite(value)) return;
+  value = std::min(this->traits.get_max_value(), std::max(this->traits.get_min_value(), value));
   this->publish_state(value);
   this->pref_.save(&value);
 }
@@ -38,6 +41,16 @@ void VpdSwitch::setup() {
 }
 
 // ---------- VpdKalman ----------
+void VpdKalman::watch_sensor_(sensor::Sensor *sensor, unsigned index) {
+  sensor->add_on_state_callback([this, index](float) { this->sensor_clock_[index].received(millis()); });
+}
+
+float VpdKalman::fresh_state_(sensor::Sensor *sensor, unsigned index) {
+  return sensor != nullptr && sensor->has_state() &&
+                 this->sensor_clock_[index].fresh(this->in_.now_ms, this->in_.sensor_timeout_ms)
+             ? sensor->state : NAN;
+}
+
 // Registered at code generation time (before any setup), so they also see
 // the first state that is restored during boot - exactly like on_value /
 // on_turn_off automations would.
@@ -82,6 +95,7 @@ void VpdKalman::setup() {
   this->stored_day_ = fan.saved_u_day;
   this->stored_night_ = fan.saved_u_night;
 
+#ifdef USE_VPD_FAN_CURVE
   // Fan curve learning (Kalman controller only), scores survive a restart
   if (this->room_temperature_ != nullptr) {
     FanCurveBank &bank = this->core_.kalman.fan_curve();
@@ -92,6 +106,7 @@ void VpdKalman::setup() {
     this->curve_active_saved_ = bank.active();
   }
 
+#endif
   // Set the fan right away, not only at the first control tick.
   // Automatic: last stored controller value. Manual: manual speed.
   this->apply_level_(fan.boot_level(this->control_->state, state_of_(this->manual_speed_)));
@@ -108,12 +123,12 @@ void VpdKalman::update() {
     in.night = false;
   }
   in.ext = this->external_climate_ ? this->external_climate_() : ExternalClimate{};
-  in.t = state_of_(this->temperature_);
-  in.rh = state_of_(this->humidity_);
-  in.leaf = state_of_(this->leaf_temperature_);
+  in.t = fresh_state_(this->temperature_, 0);
+  in.rh = fresh_state_(this->humidity_, 1);
+  in.leaf = fresh_state_(this->leaf_temperature_, 2);
   in.leaf_switch = this->leaf_switch_->state;
-  in.room_t = state_of_(this->room_temperature_);
-  in.room_rh = state_of_(this->room_humidity_);
+  in.room_t = fresh_state_(this->room_temperature_, 3);
+  in.room_rh = fresh_state_(this->room_humidity_, 4);
   in.auto_on = this->control_->state;
   in.tent_open = this->tent_open_ != nullptr && this->tent_open_->state;
   in.force_fallback = this->force_fallback_ != nullptr && this->force_fallback_->state;
@@ -193,6 +208,7 @@ void VpdKalman::update() {
     this->stored_night_ = fan.saved_u_night;
     this->pref_night_.save(&this->stored_night_);
   }
+#ifdef USE_VPD_FAN_CURVE
   if (this->room_temperature_ != nullptr) {
     // Every 6 h, and right away when the learned curve is taken over or given up
     const FanCurveBank &bank = this->core_.kalman.fan_curve();
@@ -208,9 +224,12 @@ void VpdKalman::update() {
     }
   }
 
+#endif
   // Diagnostics
   const Outputs &o = this->out_;
   publish_binary_(this->b_fallback_, o.fallback_active);
+  if (this->s_measured_vpd_ != nullptr)
+    this->s_measured_vpd_->publish_state(o.measured_vpd);
   if (this->s_control_vpd_ != nullptr)
     this->s_control_vpd_->publish_state(o.control_vpd);
   if (this->s_target_active_ != nullptr)
@@ -259,6 +278,13 @@ void VpdKalman::dump_config() {
   ESP_LOGCONFIG(TAG, "  VPD target: %s", this->target_ != nullptr ? "single" : "day/night");
   ESP_LOGCONFIG(TAG, "  External tent climate: %s", this->external_climate_ ? "yes" : "no");
   ESP_LOGCONFIG(TAG, "  Leaf temperature sensor: %s", this->leaf_temperature_ != nullptr ? "yes" : "no");
+  ESP_LOGCONFIG(TAG, "  Sensor timeout: %u ms", (unsigned) this->in_.sensor_timeout_ms);
+  ESP_LOGCONFIG(TAG, "  Protection in manual mode: %s", this->in_.safety_in_manual ? "yes" : "no");
+#ifdef USE_VPD_FAN_CURVE
+  ESP_LOGCONFIG(TAG, "  Experimental fan curve learning: enabled");
+#else
+  ESP_LOGCONFIG(TAG, "  Fan curve learning: disabled");
+#endif
   LOG_UPDATE_INTERVAL(this);
 }
 
