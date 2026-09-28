@@ -1,5 +1,7 @@
 # esphome-vpd-regler
 
+**English** | [Deutsch](README.de.md)
+
 > [!WARNING]
 > **This repository was created entirely with AI.** The code, the
 > documentation and the tests were written by an AI assistant.
