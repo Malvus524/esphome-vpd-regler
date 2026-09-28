@@ -90,8 +90,13 @@ void VpdKalman::setup() {
 void VpdKalman::update() {
   Inputs &in = this->in_;
   in.now_ms = millis();
-  in.night_has_state = this->night_->has_state();
-  in.night = this->night_->state;
+  if (this->night_ != nullptr) {
+    in.night_has_state = this->night_->has_state();
+    in.night = this->night_->state;
+  } else {
+    in.night_has_state = true;  // always day: no boot wait, no light change
+    in.night = false;
+  }
   in.ext = this->external_climate_ ? this->external_climate_() : ExternalClimate{};
   in.t = state_of_(this->temperature_);
   in.rh = state_of_(this->humidity_);
@@ -103,8 +108,12 @@ void VpdKalman::update() {
   in.tent_open = this->tent_open_ != nullptr && this->tent_open_->state;
   in.force_fallback = this->force_fallback_ != nullptr && this->force_fallback_->state;
   in.manual_speed = state_of_(this->manual_speed_);
-  in.target_day = state_of_(this->target_day_);
-  in.target_night = state_of_(this->target_night_);
+  if (this->target_ != nullptr) {
+    in.target_day = in.target_night = this->target_->state;
+  } else {
+    in.target_day = state_of_(this->target_day_);
+    in.target_night = state_of_(this->target_night_);
+  }
   in.deadband = state_of_(this->deadband_);
   in.sacrifice = state_of_(this->sacrifice_);
   in.speed = state_of_(this->speed_);
@@ -117,8 +126,12 @@ void VpdKalman::update() {
   in.temp_band = state_of_(this->temp_band_);
   in.rh_max = state_of_(this->rh_max_);
   in.rh_band = state_of_(this->rh_band_);
-  in.leaf_offset_day = state_of_(this->leaf_offset_day_);
-  in.leaf_offset_night = state_of_(this->leaf_offset_night_);
+  if (this->leaf_offset_ != nullptr) {
+    in.leaf_offset_day = in.leaf_offset_night = this->leaf_offset_->state;
+  } else {
+    in.leaf_offset_day = state_of_(this->leaf_offset_day_);
+    in.leaf_offset_night = state_of_(this->leaf_offset_night_);
+  }
   for (int i = 0; i < TUNING_COUNT; i++) {
     in.tuning.*TUNING_FIELDS[i] =
         this->tuning_number_[i] != nullptr ? this->tuning_number_[i]->state : this->tuning_value_[i];
@@ -209,6 +222,8 @@ void VpdKalman::dump_config() {
   ESP_LOGCONFIG(TAG, "  Mode: %s", this->room_temperature_ == nullptr
                                          ? "fallback controller only (no room sensor)"
                                          : "Kalman filter, fallback controller if the room sensor fails");
+  ESP_LOGCONFIG(TAG, "  Day/night sensor: %s", this->night_ != nullptr ? "yes" : "no (always day)");
+  ESP_LOGCONFIG(TAG, "  VPD target: %s", this->target_ != nullptr ? "single" : "day/night");
   ESP_LOGCONFIG(TAG, "  External tent climate: %s", this->external_climate_ ? "yes" : "no");
   ESP_LOGCONFIG(TAG, "  Leaf temperature sensor: %s", this->leaf_temperature_ != nullptr ? "yes" : "no");
   LOG_UPDATE_INTERVAL(this);

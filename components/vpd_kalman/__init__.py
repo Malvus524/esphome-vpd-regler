@@ -1,7 +1,7 @@
 """VPD controller for grow tents: excess-humidity controller with Kalman filter.
 
-Drives one exhaust fan so that the tent reaches a VPD target for day and
-night. All settings are created as number/switch entities, all diagnostics
+Drives one exhaust fan so that the tent reaches a VPD target, one for day
+and night or separate ones if a day/night sensor is configured. All settings are created as number/switch entities, all diagnostics
 are optional sensors. See README.md.
 
 With room_temperature/room_humidity the Kalman controller runs and the
@@ -69,8 +69,9 @@ CONF_TUNING = "tuning"
 # key: (default name, icon, unit, min, max, step, initial, entity category)
 NUMBERS = {
     "manual_speed": ("Fan manual speed", "mdi:fan", "%", 1, 100, 1, 50, None),
-    "target_day": ("VPD target day", "mdi:target", "kPa", 0.3, 2.5, 0.01, 1.1, ENTITY_CATEGORY_CONFIG),
-    "target_night": ("VPD target night", "mdi:target", "kPa", 0.3, 2.5, 0.01, 0.9, ENTITY_CATEGORY_CONFIG),
+    "target": ("VPD target", "mdi:target", "kPa", 0.3, 2.5, 0.01, 1.2, ENTITY_CATEGORY_CONFIG),
+    "target_day": ("VPD target day", "mdi:target", "kPa", 0.3, 2.5, 0.01, 1.2, ENTITY_CATEGORY_CONFIG),
+    "target_night": ("VPD target night", "mdi:target", "kPa", 0.3, 2.5, 0.01, 1.0, ENTITY_CATEGORY_CONFIG),
     "deadband": ("VPD deadband", "mdi:arrow-expand-horizontal", "kPa", 0.01, 0.5, 0.01, 0.05,
                  ENTITY_CATEGORY_CONFIG),
     "vpd_sacrifice": ("Allowed VPD sacrifice", "mdi:scale-balance", "kPa", 0, 0.3, 0.005, 0.03,
@@ -90,6 +91,7 @@ NUMBERS = {
     "humidity_max": ("Safety humidity max", "mdi:water-percent-alert", "%", 40, 95, 1, 75,
                      ENTITY_CATEGORY_CONFIG),
     "humidity_band": ("Safety humidity P-band", "mdi:water-percent", "%", 1, 30, 1, 10, ENTITY_CATEGORY_CONFIG),
+    "leaf_offset": ("Leaf offset", "mdi:leaf", "°C", -10, 5, 0.1, -2.0, ENTITY_CATEGORY_CONFIG),
     "leaf_offset_day": ("Leaf offset day", "mdi:white-balance-sunny", "°C", -10, 5, 0.1, -2.0,
                         ENTITY_CATEGORY_CONFIG),
     "leaf_offset_night": ("Leaf offset night", "mdi:weather-night", "°C", -10, 5, 0.1, -1.0,
@@ -99,6 +101,16 @@ NUMBERS = {
 # Optional tuning parameters (tuning:). Not set = the built-in default, no
 # entity. A plain value (for s/min also a time like "2min") fixes it, a block
 # with name makes it a number entity that can be changed live.
+# Targets and leaf offsets: which ones exist depends on the night sensor
+# (see _check_night), so they get no default in the schema.
+# Single target: "target", with night sensor also possible instead of
+# target_day/target_night. Leaf offset: day/night with night sensor.
+SINGLE_TARGET = {"target"}
+DAY_NIGHT_TARGET = {"target_day", "target_night"}
+SINGLE_LEAF_OFFSET = {"leaf_offset"}
+DAY_NIGHT_LEAF_OFFSET = {"leaf_offset_day", "leaf_offset_night"}
+MODE_NUMBERS = SINGLE_TARGET | DAY_NIGHT_TARGET | SINGLE_LEAF_OFFSET | DAY_NIGHT_LEAF_OFFSET
+
 # key: (default name, icon, unit, min, max, step, default)
 TUNING = {
     # Switching Kalman <-> fallback when a configured room sensor fails
@@ -127,6 +139,9 @@ TUNING = {
     "limit_test_margin": ("Limit test margin", "mdi:plus-minus-variant", "kPa", 0, 0.1, 0.001, 0.01),
     "limit_test_max_pause": ("Limit test max. pause", "mdi:timer-pause-outline", "min", 5, 480, 5, 60),
 }
+
+# Only meaningful with a day/night sensor: rejected without night
+NIGHT_ONLY_TUNING = {"light_memory_after", "light_memory_delay", "boot_wait_night"}
 
 # key: (default name, icon, restore mode, entity category)
 SWITCHES = {
@@ -191,7 +206,17 @@ def _number_schema(key):
             cv.Optional(CONF_MODE, default="BOX"): cv.enum(number.NUMBER_MODES, upper=True),
         }
     )
+    if key in MODE_NUMBERS:
+        # Default name added in _check_night if the mode needs it
+        return cv.Optional(key), _with_default_name(schema, name)
     return cv.Optional(key, default={CONF_NAME: name}), schema
+
+
+def _with_default_name(schema, name):
+    def validate(value):
+        return schema({CONF_NAME: name, **(value or {})})
+
+    return validate
 
 
 def _switch_schema(key):
@@ -261,7 +286,7 @@ STORAGE_KEYS_SCHEMA = cv.Schema(
 _schema = {
     cv.GenerateID(): cv.declare_id(VpdKalman),
     cv.Required(CONF_OUTPUT): cv.use_id(output.FloatOutput),
-    cv.Required(CONF_NIGHT): cv.use_id(binary_sensor.BinarySensor),
+    cv.Optional(CONF_NIGHT): cv.use_id(binary_sensor.BinarySensor),
     cv.Required(CONF_TEMPERATURE): cv.use_id(sensor.Sensor),
     cv.Required(CONF_HUMIDITY): cv.use_id(sensor.Sensor),
     cv.Optional(CONF_LEAF_TEMPERATURE): cv.use_id(sensor.Sensor),
@@ -307,6 +332,41 @@ def _is_fallback(config):
     return CONF_ROOM_TEMPERATURE not in config
 
 
+def _check_night(config):
+    # Without night sensor there is only one target and one leaf offset.
+    # With night sensor day/night targets, or one target if "target" is
+    # given, and always day/night leaf offsets.
+    night = CONF_NIGHT in config
+    if "target" in config:
+        for key in DAY_NIGHT_TARGET:
+            if key in config:
+                raise cv.Invalid(f"'{key}' cannot be combined with 'target'", path=[key])
+    not_allowed = (DAY_NIGHT_TARGET | DAY_NIGHT_LEAF_OFFSET) if not night else SINGLE_LEAF_OFFSET
+    for key in not_allowed:
+        if key in config:
+            if night:
+                raise cv.Invalid(
+                    f"'{key}' is only used without 'night', use leaf_offset_day/leaf_offset_night", path=[key]
+                )
+            raise cv.Invalid(f"'{key}' needs 'night' (day/night binary sensor)", path=[key])
+    if not night:
+        for key in config[CONF_TUNING]:
+            if key in NIGHT_ONLY_TUNING:
+                raise cv.Invalid(f"'{key}' needs 'night' (day/night binary sensor)", path=[CONF_TUNING, key])
+        for key in (CONF_DAY, CONF_NIGHT_KEY):
+            if key in config[CONF_STORAGE_KEYS]:
+                raise cv.Invalid(
+                    f"'{key}' needs 'night' (day/night binary sensor)", path=[CONF_STORAGE_KEYS, key]
+                )
+    # Create the entities of this mode with their default names
+    targets = SINGLE_TARGET if (not night or "target" in config) else DAY_NIGHT_TARGET
+    offsets = DAY_NIGHT_LEAF_OFFSET if night else SINGLE_LEAF_OFFSET
+    for key in targets | offsets:
+        if key not in config:
+            config[key] = _number_schema(key)[1]({})
+    return config
+
+
 def _check_mode(config):
     # Without room sensor only the fallback controller runs. Numbers have
     # defaults and are simply not created, diagnostic sensors and tuning
@@ -330,6 +390,7 @@ def _check_mode(config):
 CONFIG_SCHEMA = cv.All(
     cv.Schema(_schema).extend(cv.COMPONENT_SCHEMA),
     cv.has_none_or_all_keys(CONF_ROOM_TEMPERATURE, CONF_ROOM_HUMIDITY),
+    _check_night,
     _check_mode,
 )
 
@@ -339,7 +400,8 @@ async def to_code(config):
     await cg.register_component(var, config)
 
     cg.add(var.set_output(await cg.get_variable(config[CONF_OUTPUT])))
-    cg.add(var.set_night(await cg.get_variable(config[CONF_NIGHT])))
+    if CONF_NIGHT in config:
+        cg.add(var.set_night(await cg.get_variable(config[CONF_NIGHT])))
     cg.add(var.set_temperature(await cg.get_variable(config[CONF_TEMPERATURE])))
     cg.add(var.set_humidity(await cg.get_variable(config[CONF_HUMIDITY])))
     if CONF_LEAF_TEMPERATURE in config:
@@ -384,7 +446,7 @@ async def to_code(config):
 
     skip = KALMAN_ONLY if fallback else set()
     for key in NUMBERS:
-        if key in skip:
+        if key in skip or key not in config:
             continue
         conf = config[key]
         num = await number.new_number(

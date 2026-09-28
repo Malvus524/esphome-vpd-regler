@@ -58,6 +58,7 @@ class VpdKalman : public PollingComponent {
 
   // ---------- Configuration ----------
   void set_output(output::FloatOutput *out) { this->output_ = out; }
+  // Without night sensor the controller always runs in the day phase
   void set_night(binary_sensor::BinarySensor *s) { this->night_ = s; }
   void set_temperature(sensor::Sensor *s) { this->temperature_ = s; }
   void set_humidity(sensor::Sensor *s) { this->humidity_ = s; }
@@ -87,6 +88,8 @@ class VpdKalman : public PollingComponent {
 
   // Settings
   void set_manual_speed_number(VpdNumber *n);
+  // Single target (day and night) or target day/night
+  void set_target_number(VpdNumber *n) { this->target_ = n; }
   void set_target_day_number(VpdNumber *n) { this->target_day_ = n; }
   void set_target_night_number(VpdNumber *n) { this->target_night_ = n; }
   void set_deadband_number(VpdNumber *n) { this->deadband_ = n; }
@@ -101,6 +104,8 @@ class VpdKalman : public PollingComponent {
   void set_temperature_band_number(VpdNumber *n) { this->temp_band_ = n; }
   void set_humidity_max_number(VpdNumber *n) { this->rh_max_ = n; }
   void set_humidity_band_number(VpdNumber *n) { this->rh_band_ = n; }
+  // Single leaf offset (without night sensor) or leaf offset day/night
+  void set_leaf_offset_number(VpdNumber *n) { this->leaf_offset_ = n; }
   void set_leaf_offset_day_number(VpdNumber *n) { this->leaf_offset_day_ = n; }
   void set_leaf_offset_night_number(VpdNumber *n) { this->leaf_offset_night_ = n; }
 
@@ -155,10 +160,10 @@ class VpdKalman : public PollingComponent {
   sensor::Sensor *room_temperature_{nullptr}, *room_humidity_{nullptr};
   std::function<ExternalClimate()> external_climate_;
 
-  VpdNumber *manual_speed_{nullptr}, *target_day_{nullptr}, *target_night_{nullptr}, *deadband_{nullptr},
+  VpdNumber *manual_speed_{nullptr}, *target_{nullptr}, *target_day_{nullptr}, *target_night_{nullptr}, *deadband_{nullptr},
       *sacrifice_{nullptr}, *speed_{nullptr}, *transition_{nullptr}, *open_max_{nullptr}, *fan_min_{nullptr},
       *fan_max_{nullptr}, *emergency_{nullptr}, *temp_max_{nullptr}, *temp_band_{nullptr}, *rh_max_{nullptr},
-      *rh_band_{nullptr}, *leaf_offset_day_{nullptr}, *leaf_offset_night_{nullptr};
+      *rh_band_{nullptr}, *leaf_offset_{nullptr}, *leaf_offset_day_{nullptr}, *leaf_offset_night_{nullptr};
   float tuning_value_[TUNING_COUNT];         // NAN = not configured
   VpdNumber *tuning_number_[TUNING_COUNT] = {};
   VpdSwitch *control_{nullptr}, *tent_open_{nullptr}, *leaf_switch_{nullptr}, *force_fallback_{nullptr};

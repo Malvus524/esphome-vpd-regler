@@ -46,12 +46,14 @@ An [ESPHome](https://esphome.io) external component that controls the
 - Finds the **sensible maximum**: it stops speeding up the fan once more air
   would gain less VPD than you are willing to give up (saves energy and noise,
   especially in winter)
-- Separate **day and night targets**, smooth **setpoint transition** after
-  light changes, remembered fan speed per light phase
+- One **VPD target**, or with a day/night sensor separate **day and night
+  targets**, smooth **setpoint transition** after light changes and
+  remembered fan speed per light phase, see [Day/night sensor](#daynight-sensor-optional)
 - **Temperature and humidity safety** that overrides the controller, with
   one notification per episode
 - **Tent open** switch that pauses the controller while you work in the tent
-- Leaf temperature from an IR sensor (e.g. MLX90614) or a fixed day/night offset
+- Leaf temperature from an IR sensor (e.g. MLX90614) or a fixed offset (day/night
+  with a day/night sensor)
 - Optional second tent sensor (e.g. over ESP-NOW) via a lambda
 - **Fallback controller** that only needs the tent sensor: it takes over
   automatically while the room sensor fails, or runs alone if you have no
@@ -132,14 +134,16 @@ has to run unattended, stay on a tag. To go back, set the tag again.
 ```yaml
 vpd_kalman:
   output: fan_pwm              # float output driving the fan
-  night: lights_off            # binary sensor, ON = night
   temperature: tent_temperature
   humidity: tent_humidity
   room_temperature: room_temperature
   room_humidity: room_humidity
+  night: lights_off            # optional: binary sensor, ON = night
 ```
 
-This creates all settings and switches with English names. The controller
+This creates all settings and switches with English names. Without `night`
+there is one *VPD target*, with it a day and a night target, see
+[Day/night sensor](#daynight-sensor-optional). The controller
 starts in **manual mode**: turn on the switch *VPD control* to let it drive
 the fan. A complete example with sensors, diagnostics and notifications is in
 [example.yaml](example.yaml).
@@ -153,9 +157,9 @@ the fan. A complete example with sensors, diagnostics and notifications is in
 | Key | Required | Description |
 |---|---|---|
 | `output` | yes | Float output of the fan (e.g. `ledc`). The controller writes 1-100 %, it never switches the fan off. Use `min_power`/`max_power` of the output to map that to your fan. |
-| `night` | yes | Binary sensor, ON = night (lights off). Day/night selects the target, the leaf offset and the remembered fan speed. Until it has a state after boot, the controller holds the fan (max. 3 min). |
+| `night` | no | Binary sensor, ON = night (lights off). Day/night selects the target, the leaf offset and the remembered fan speed. Until it has a state after boot, the controller holds the fan (max. 3 min). Without it there is only one target and one leaf offset, see [Day/night sensor](#daynight-sensor-optional). |
 | `temperature`, `humidity` | yes | Tent air sensor. |
-| `leaf_temperature` | no | Leaf temperature sensor (IR). Used while the switch *Leaf temperature from sensor* is on and the value is within `leaf_max_deviation` of the air temperature. Otherwise air temperature + leaf offset day/night. |
+| `leaf_temperature` | no | Leaf temperature sensor (IR). Used while the switch *Leaf temperature from sensor* is on and the value is within `leaf_max_deviation` of the air temperature. Otherwise air temperature + leaf offset. |
 | `room_temperature`, `room_humidity` | no | Air the fan draws in. Both or none. With them the Kalman controller runs, and the [fallback controller](#fallback-controller) takes over while they fail. Without them only the fallback controller runs. |
 | `external_climate` | no | Lambda returning `vpd_kalman::ExternalClimate` with `temperature`, `humidity`, `leaf_temperature` (and `selected` for the log). If all three are valid, they are used instead of the own sensors, e.g. for a second sensor at canopy height. See below. |
 
@@ -176,15 +180,18 @@ control law are tuned for it.
 
 ### Settings (number entities)
 
-All are created automatically, stored in flash and shown as boxes. Each
+All are created automatically, stored in flash and shown as boxes. Which
+targets and leaf offsets exist depends on `night`, see
+[Day/night sensor](#daynight-sensor-optional). Each
 accepts the usual number options (`name`, `id`, `icon`, `entity_category`,
 ...) plus `min_value`, `max_value`, `step` and `initial_value`.
 
 | Key | Default name | Default | Range | Meaning |
 |---|---|---|---|---|
 | `manual_speed` | Fan manual speed | 50 % | 1-100 | Fan speed while *VPD control* is off. |
-| `target_day` | VPD target day | 1.1 kPa | 0.3-2.5 | |
-| `target_night` | VPD target night | 0.9 kPa | 0.3-2.5 | |
+| `target` | VPD target | 1.2 kPa | 0.3-2.5 | Without `night`, or with `night` if you add this key: one target for day and night. |
+| `target_day` | VPD target day | 1.2 kPa | 0.3-2.5 | Only with `night`. |
+| `target_night` | VPD target night | 1.0 kPa | 0.3-2.5 | Only with `night`. |
 | `deadband` | VPD deadband | 0.05 kPa | 0.01-0.5 | Target +/- this counts as reached, the fan stays where it is. |
 | `vpd_sacrifice` | Allowed VPD sacrifice | 0.03 kPa | 0-0.3 | How much VPD the controller may give up to save fan. 0 = run up to *Fan maximum automatic*. |
 | `speed` | Controller speed | 0.25 | 0.05-1 | 0.25 is critically damped according to the model. Higher = faster, but may oscillate if the tent is slower than `time_constant`. |
@@ -197,8 +204,9 @@ accepts the usual number options (`name`, `id`, `icon`, `entity_category`,
 | `temperature_band` | Safety temperature P-band | 3 K | 0.5-10 | |
 | `humidity_max` | Safety humidity max | 75 % | 40-95 | Must be above the humidity your VPD target results in. |
 | `humidity_band` | Safety humidity P-band | 10 % | 1-30 | |
-| `leaf_offset_day` | Leaf offset day | -2.0 °C | -10-5 | Leaf temperature = air + offset, when no valid leaf sensor value is used. |
-| `leaf_offset_night` | Leaf offset night | -1.0 °C | -10-5 | |
+| `leaf_offset` | Leaf offset | -2.0 °C | -10-5 | Leaf temperature = air + offset, when no valid leaf sensor value is used. Only without `night`. |
+| `leaf_offset_day` | Leaf offset day | -2.0 °C | -10-5 | Offset in the day phase. Only with `night`. |
+| `leaf_offset_night` | Leaf offset night | -1.0 °C | -10-5 | Only with `night`. |
 
 ### Switches
 
@@ -308,6 +316,47 @@ speed* are not created and `time_constant` is ignored. The Kalman-only
 diagnostics (`excess`, `excess_target`, `moisture_load`,
 `next_step_benefit`, `vpd_at_max`) and tuning parameters are rejected.
 
+## Day/night sensor (optional)
+
+Without `night` the controller always runs in one phase: one *VPD target*,
+one *Leaf offset*, no waiting for day/night after boot. The setpoint
+transition still runs after closing the tent and after a target change.
+
+```yaml
+vpd_kalman:
+  output: fan_pwm
+  temperature: tent_temperature
+  humidity: tent_humidity
+  target:
+    name: "VPD target"
+    initial_value: 1.1
+```
+
+With `night` you get separate day and night targets. Light changes are
+big, predictable jumps, so the controller then also jumps to the fan speed
+it remembered for the new light phase, starts a setpoint transition and
+uses the leaf offset of the phase. If you want one target but these
+benefits, add `target` as well: it replaces *VPD target day/night*, the leaf
+offsets stay separate.
+
+```yaml
+vpd_kalman:
+  # ...
+  night: lights_off
+  target:
+    name: "VPD target"
+```
+
+| | without `night` | with `night` | with `night` + `target` |
+|---|---|---|---|
+| Targets | `target` | `target_day`, `target_night` | `target` |
+| Leaf offsets | `leaf_offset` | `leaf_offset_day`, `leaf_offset_night` | `leaf_offset_day`, `leaf_offset_night` |
+| Fan speed per light phase, transition on light change | - | yes | yes |
+
+Keys of the other variant are rejected, as are the tuning parameters
+`light_memory_after`, `light_memory_delay`, `boot_wait_night` and
+`storage_keys` `day`/`night` without `night`.
+
 ## Tuning parameters (optional)
 
 For setups that differ from the defaults. Leave a parameter out and the
@@ -330,10 +379,10 @@ vpd_kalman:
 |---|---|---|---|---|---|
 | `room_fallback_delay` | min | 2 | 0.5-60 | switch | How long the room sensor may be missing before the fallback takes over. |
 | `room_return_delay` | min | 1 | 0.5-60 | switch | How long the room sensor must deliver again before the Kalman controller is back. |
-| `light_memory_after` | min | 20 | 0-240 | Kalman | Time after a light change before the fan of this light phase is remembered. |
-| `light_memory_delay` | min | 5 | 0.5-60 | Kalman | The value remembered is the one from this long ago, so the late end of a light phase does not spoil it. |
+| `light_memory_after` | min | 20 | 0-240 | Kalman | Time after a light change before the fan of this light phase is remembered. Only with `night`. |
+| `light_memory_delay` | min | 5 | 0.5-60 | Kalman | The value remembered is the one from this long ago, so the late end of a light phase does not spoil it. Only with `night`. |
 | `boot_wait_tent` | s | 60 | 10-600 | both | After boot, hold the fan this long while no tent value has arrived. |
-| `boot_wait_night` | s | 180 | 10-1800 | both | After boot, hold the fan this long while day/night is unknown. |
+| `boot_wait_night` | s | 180 | 10-1800 | both | After boot, hold the fan this long while day/night is unknown. Only with `night`. |
 | `sensible_max_rate` | %/min | 5 | 0.1-100 | Kalman | How fast the sensible maximum may change. |
 | `sensor_noise` | kPa | 0.0063 | 0.001-0.1 | Kalman | Measurement noise of the vapour pressure excess. Higher = the filter trusts single readings less. |
 | `load_change_per_hour` | %/h | 10 | 1-200 | Kalman | How fast the moisture load may change. Higher = the load estimate follows faster but noisier. |
@@ -400,7 +449,8 @@ vpd_kalman:
 Entities keep their Home Assistant history and stored values if you give
 them the same `name` (the flash key is derived from it) and the same `id`
 (for your other lambdas). If your old setup stored the controller values in
-restoring `globals:`, point `storage_keys` to their ids:
+restoring `globals:`, point `storage_keys` to their ids (`day` and `night`
+only with a day/night sensor):
 
 ```yaml
 vpd_kalman:

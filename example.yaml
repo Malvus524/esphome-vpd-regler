@@ -4,7 +4,8 @@
 # ESP32 with two SHT4x (tent and room, on separate I2C buses because both
 # use address 0x44), an optional MLX90614 for the leaf temperature and a
 # PWM fan. Day/night comes from a light schedule here - a light sensor
-# works just as well (binary sensor ON = night).
+# works just as well (binary sensor ON = night). Without a day/night sensor
+# remove "night:" and the binary sensor: there is one VPD target then.
 # ==================================================================
 esphome:
   name: grow-tent
@@ -109,7 +110,10 @@ vpd_kalman:
   # change defaults like this:
   target_day:
     name: "VPD target day"
-    initial_value: 1.2
+    initial_value: 1.1
+  # One target for day and night instead of target_day/target_night:
+  # target:
+  #   name: "VPD target"
 
   # Diagnostics (optional)
   control_vpd:
