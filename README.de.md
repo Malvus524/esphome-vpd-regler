@@ -236,7 +236,7 @@ Die Schlüssel sind englisch und bleiben so. In den Tabellen steht unter
 | `time_constant` | `21s` | Zeit, die das Zelt bei 100 % Lüfter braucht, bis 63 % einer Feuchteänderung abgeführt sind (`tau`). Legt die Filterdynamik fest und, zusammen mit *Controller speed*, wie schnell der Regler eingreift. Nur Kalman-Regler. |
 | `leaf_max_deviation` | `6.0` | Blattsensorwerte, die weiter als dieser Wert (°C) von der Lufttemperatur entfernt sind, gelten als Messfehler. |
 | `language` | `en` | `en` oder `de`: Zustandstexte, Benachrichtigungen und Logzeilen. |
-| `storage_keys` | - | Nur für den Umstieg von einer `globals:`-Lösung, siehe unten. |
+| `storage_keys` | - | Nur für den Umstieg von einer älteren YAML-Lösung: Gib `controller_output`, `day` und `night` die IDs deiner wiederherstellenden `globals:`, damit deren gespeicherte Werte erhalten bleiben. |
 | `tuning` | - | Optionale Tuning-Parameter, siehe [unten](#tuning-parameter-optional). |
 | `on_message` | - | Automation mit `title` und `message` (`std::string`) für Benachrichtigungen. |
 
@@ -480,22 +480,6 @@ vpd_kalman:
       c.leaf_temperature = id(canopy_temperature).state - 2.0f;
     }
     return c;
-```
-
-## Umstieg von einem YAML-Lambda
-
-Entitäten behalten ihren Home-Assistant-Verlauf und ihre gespeicherten Werte,
-wenn du ihnen denselben `name` (daraus wird der Flash-Schlüssel abgeleitet)
-und dieselbe `id` (für deine anderen Lambdas) gibst. Hat deine alte Lösung
-die Reglerwerte in wiederherstellenden `globals:` gespeichert, verweise mit
-`storage_keys` auf deren IDs (`day` und `night` nur mit Tag/Nacht-Sensor):
-
-```yaml
-vpd_kalman:
-  storage_keys:
-    controller_output: u_vpd_gespeichert
-    day: u_tag_gespeichert
-    night: u_nacht_gespeichert
 ```
 
 ## Lizenz

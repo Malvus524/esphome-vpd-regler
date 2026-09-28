@@ -216,7 +216,7 @@ Keys of the other variant are rejected, as are the tuning parameters
 | `time_constant` | `21s` | Time the tent needs at 100 % fan until 63 % of a humidity change is exhausted (`tau`). Sets the filter dynamics and, together with *Controller speed*, how fast the controller acts. Kalman controller only. |
 | `leaf_max_deviation` | `6.0` | Leaf sensor values further than this (°C) from the air temperature count as measurement errors. |
 | `language` | `en` | `en` or `de`: state texts, notifications and log lines. |
-| `storage_keys` | - | Only for migrating from a `globals:` setup, see below. |
+| `storage_keys` | - | Only for migrating from an older YAML setup: give `controller_output`, `day` and `night` the ids of your restoring `globals:`, so their stored values are kept. |
 | `tuning` | - | Optional tuning parameters, see [below](#tuning-parameters-optional). |
 | `on_message` | - | Automation with `title` and `message` (`std::string`) for notifications. |
 
@@ -453,22 +453,6 @@ vpd_kalman:
       c.leaf_temperature = id(canopy_temperature).state - 2.0f;
     }
     return c;
-```
-
-## Migrating from a YAML lambda
-
-Entities keep their Home Assistant history and stored values if you give
-them the same `name` (the flash key is derived from it) and the same `id`
-(for your other lambdas). If your old setup stored the controller values in
-restoring `globals:`, point `storage_keys` to their ids (`day` and `night`
-only with a day/night sensor):
-
-```yaml
-vpd_kalman:
-  storage_keys:
-    controller_output: u_vpd_gespeichert
-    day: u_tag_gespeichert
-    night: u_nacht_gespeichert
 ```
 
 ## License
