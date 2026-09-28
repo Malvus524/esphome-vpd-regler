@@ -61,6 +61,26 @@ steigenden VPD. Die Grenzsuchstrategie des Ersatzreglers bleibt erhalten.
 
 ### Ruhigere Regelung
 
+Sollwert- und Tag-/Nachtwechsel starten die Rampe am zuletzt aktiven Sollwert.
+Ein Wechsel von 1,3 auf 1,1 kPa bleibt damit zwischen 1,3 und 1,1 kPa, auch wenn
+der gemessene VPD nur 0,95 kPa beträgt. Eine erneute Änderung setzt am aktuellen
+Zwischenwert an. `transition: 0` beendet eine laufende Rampe sofort.
+Eine Änderung der Übergangszeit während der Rampe verteilt die verbleibende
+Strecke ab dem aktuellen Zwischenwert auf die neu eingestellte Zeit.
+Der Sanftanlauf nach Zeltöffnung oder Sensorquellenwechsel bleibt messwertbezogen.
+
+Die wirtschaftliche Lüftergrenze berücksichtigt jetzt die Unsicherheit der
+Feuchtelastschätzung. Änderungen über 0,5 Prozentpunkte müssen drei Regeltakte
+lang in dieselbe Richtung zeigen; danach greift weiterhin die vorhandene
+Änderungsrate. Bei `vpd_sacrifice: 0` entfällt diese Begrenzung sofort.
+Der Ersatzregler startet Grenztests nur bei geringem Rauschen und Drift, hält
+die Testleistung konstant und verwirft gestörte oder uneindeutige Ergebnisse.
+Nach uneindeutigen Tests wartet er länger und verkleinert den nächsten Schritt.
+
+Für echte Sensorverläufe gibt es ein [Replay-Werkzeug](tools/README.md), auch für
+Home-Assistant-Historien. Es prüft Reglerentscheidungen; es berechnet keine
+hypothetische Klimawirkung einer anderen Lüfterleistung.
+
 Einzelne VPD-Sprünge mit mehr als 0,1 kPa Abstand zum Median der letzten drei
 Regeltakte werden unterdrückt. Kleinere Änderungen passieren sofort; anhaltende
 große Änderungen werden beim zweiten Messwert angenommen. Der Hauptregler glättet
@@ -173,10 +193,11 @@ Alle 10 s
    innerhalb des Totbands nichts,
 5. wendet er die Sicherheit an: `Ausgang = max(Regler, Temperatur-P, Feuchte-P)`.
 
-Nach einem Lichtwechsel und nach dem Schließen des Zelts beginnt das wirksame
-Ziel beim gemessenen VPD und läuft innerhalb der Zeit für den
-*Sollwert-Übergang* zum Ziel. So kämpft der Lüfter nicht gegen eine Lücke an,
-die Aufheizen oder Abkühlen von selbst schließt.
+Nach einer Sollwertänderung oder einem Lichtwechsel läuft das wirksame Ziel
+innerhalb des *Sollwert-Übergangs* vom zuletzt aktiven zum neuen Sollwert.
+Nach dem Schließen des Zelts oder einem Sensorquellenwechsel beginnt der
+Sanftanlauf dagegen beim gemessenen VPD. Ein normaler Tag-/Nachtwechsel senkt
+das Ziel dadurch nicht unter beide eingestellten Sollwerte.
 
 Die Richtung steht fest: Mehr Abluft bedeutet trockenere Luft und ein höheres
 VPD. Ist deine Raumluft feuchter als die Zeltluft, ist dieser Regler nichts

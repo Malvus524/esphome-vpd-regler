@@ -156,7 +156,8 @@ class VpdFallbackCore : public CoreBase {
     this->vpd_median_.reset();
     this->vpd_response_.reset();
     drift = dv = j0 = j1 = NAN;
-    ziel_eff = NAN; fuehr_starten = false;
+    last_test_vpd_ = NAN; step_scale_ = 1.0f;
+    ziel_eff = NAN; fuehr_starten = false; ramp_start_ = NAN;
     zustand_vorher.clear();
     grund = reason;
   }
@@ -259,6 +260,7 @@ class VpdFallbackCore : public CoreBase {
         (offen_vorher && !in.tent_open);
     if (signal_reset) {
       gn = 0; vn = 0;
+      last_test_vpd_ = NAN;
       this->vpd_median_.reset(); this->vpd_response_.reset();
     }
 
@@ -277,7 +279,7 @@ class VpdFallbackCore : public CoreBase {
 
     // Ausgleichsgerade ueber die letzten m VPD-Werte: Steigung in
     // kPa/min und Wert der Geraden beim neuesten Messwert
-    auto gerade = [&](int m, float &steigung, float &ende) -> bool {
+    auto gerade = [&](int m, float &steigung, float &ende, float &noise) -> bool {
       if (m < 3 || m > vn) return false;
       float sx = 0, sy = 0, sxx = 0, sxy = 0;
       for (int i = 0; i < m; i++) {
@@ -288,6 +290,12 @@ class VpdFallbackCore : public CoreBase {
       if (nenner <= 0) return false;
       steigung = (m * sxy - sx * sy) / nenner;
       ende = sy / m + steigung * ((m - 1) * DT - sx / m);
+      float residual = 0.0f;
+      for (int i = 0; i < m; i++) {
+        float error = vbuf[(vh - m + i + NBUF) % NBUF] - (ende + steigung * (i - m + 1) * DT);
+        residual += error * error;
+      }
+      noise = sqrtf(residual / m);
       return true;
     };
     // Mittel der letzten m VPD-Werte
@@ -364,6 +372,7 @@ class VpdFallbackCore : public CoreBase {
     offen_vorher = offen;
     // --- Lichtwechsel ---
     if (nacht_bekannt && nacht != nacht_vorher) {
+      ramp_start_ = std::isfinite(ziel_eff) ? ziel_eff : ziel_vorher;
       nacht_vorher = nacht;
       test_abbrechen(fx.a_light, false);
       u_grenze = u_max; t_stat = 0;
@@ -372,6 +381,7 @@ class VpdFallbackCore : public CoreBase {
       grund = nacht ? fx.r_lights_off : fx.r_lights_on;
     }
     if (std::isnan(ziel_vorher) || fabsf(ziel - ziel_vorher) > 0.0005f) {
+      ramp_start_ = std::isfinite(ziel_eff) ? ziel_eff : ziel_vorher;
       ziel_vorher = ziel;
       fuehr_starten = true;
       test_abbrechen(fx.a_target, false);
@@ -392,7 +402,7 @@ class VpdFallbackCore : public CoreBase {
     if (!auto_an) {
       // ================= HAND =================
       ausgang = std::max(par(in.manual_speed, 50.0f), this->manual_safety_floor_);
-      fuehr_starten = false; ziel_eff = NAN;  // kein alter Übergang beim Einschalten
+      fuehr_starten = false; ziel_eff = NAN; ramp_start_ = NAN;  // kein alter Übergang beim Einschalten
       if (in.safety_in_manual && !mess_ok)
         snprintf(zustand, sizeof(zustand), "%s", tx.tent_sensor_error);
       else if (in.safety_in_manual && u_sicher > par(in.manual_speed, 50.0f))
@@ -423,19 +433,26 @@ class VpdFallbackCore : public CoreBase {
       // ---------- Soll mit Sollwert-Übergang (wie im Kalman-Regler) ----------
       if (fuehr_starten) {
         fuehr_starten = false;
-        float abstand = fabsf(ziel - vpd);
-        if (uebergang > 0.0f && abstand > band) {
-          ziel_eff = vpd;
+        target_transition_ = std::isfinite(ramp_start_);
+        const float start = target_transition_ ? ramp_start_ : vpd;
+        ramp_start_ = NAN;
+        float abstand = fabsf(ziel - start);
+        if (uebergang > 0.0f && abstand > (target_transition_ ? 0.0005f : band)) {
+          ziel_eff = start;
           fuehr_rate = abstand / (uebergang / DT);
         } else {
           ziel_eff = NAN;
         }
       }
+      if (uebergang <= 0.0f) ziel_eff = NAN;
+      if (std::isfinite(ziel_eff) && uebergang != previous_transition_)
+        fuehr_rate = fabsf(ziel - ziel_eff) / (uebergang / DT);
+      previous_transition_ = uebergang;
       if (!std::isnan(ziel_eff)) {
         float richtung_z = ziel > ziel_eff ? 1.0f : -1.0f;
         ziel_eff += richtung_z * fuehr_rate;
         // VPD ist von selbst schon weiter Richtung Ziel -> mitgehen
-        if ((vpd - ziel_eff) * richtung_z > 0.0f) ziel_eff = vpd;
+        if (!target_transition_ && (vpd - ziel_eff) * richtung_z > 0.0f) ziel_eff = vpd;
         // Ziel erreicht oder ueberschritten -> Übergang vorbei
         if ((ziel - ziel_eff) * richtung_z <= 0.0f) ziel_eff = NAN;
       }
@@ -447,12 +464,18 @@ class VpdFallbackCore : public CoreBase {
       if (!et_gueltig) { et_vorher = et; et_gueltig = true; }
       bool sicher = u_sicher > u + 1.0f || this->protection_release_.above(u);
       t_pause++;
+      const bool disturbance = std::isfinite(last_test_vpd_) &&
+          fabsf(measured_vpd - last_test_vpd_) > std::max(0.1f, 2.0f * band);
+      last_test_vpd_ = measured_vpd;
 
       // ================= EBENE 2: GRENZFINDER =================
       if (test) {
         t_test++;
         if (sicher) {
           test_abbrechen(fx.a_safety, true);
+        } else if (disturbance) {
+          test_abbrechen("Climate disturbance", true);
+          pause_soll = std::min(2 * pause_soll, pause_max);
         } else if (e >= -band) {
           test_abbrechen(fx.a_band, false);
         } else if (t_test >= n_mess) {
@@ -462,18 +485,30 @@ class VpdFallbackCore : public CoreBase {
           float t_v1 = (t_test - (n_tau - 1) * 0.5f) * DT;
           dv = v1 - (v0 + drift * t_v1);
           j0 = kosten(e0, u_alt);
-          j1 = kosten(e0 + dv - MARGE, u);
+          float slope = 0, end = 0, noise = 0;
+          const bool stable = gerade(n_tau, slope, end, noise) &&
+              noise <= std::max(0.01f, 3.0f * test_noise_) &&
+              fabsf(slope - drift) * tau <= std::max(0.03f, band);
+          const float uncertainty = MARGE + 2.0f * (test_noise_ + noise);
+          const float error_after = e0 + dv;
+          // Compare the worst plausible result, not a favourable noisy sample.
+          j1 = std::max(kosten(error_after - uncertainty, u), kosten(error_after + uncertainty, u));
           const char *wohin = test_dir < 0 ? fx.down : fx.up;
           char erg[96];
-          if (j1 < j0) {
+          if (stable && j1 < j0) {
             richtung = test_dir;
             pause_soll = n_mess;
+            step_scale_ = std::min(1.0f, step_scale_ * 1.25f);
             snprintf(erg, sizeof(erg), fx.r_step_fmt, wohin, fx.kept, j0, j1);
           } else {
             u_grenze = g_alt;
-            richtung = -test_dir;
+            const float best_error = std::max(0.0f, fabsf(error_after) - uncertainty);
+            const bool clearly_worse = stable && kosten(best_error, u) >= j0;
+            if (clearly_worse) richtung = -test_dir;
+            else step_scale_ = std::max(0.333333f, step_scale_ * 0.5f);
             pause_soll = std::min(2 * pause_soll, pause_max);
             snprintf(erg, sizeof(erg), fx.r_step_fmt, wohin, fx.discarded, j0, j1);
+            if (!clearly_worse) loggen("Limit test inconclusive: restoring limit and reducing next step");
           }
           snprintf(buf, sizeof(buf), fx.log_result_fmt, erg, dv, u_grenze);
           loggen(buf);
@@ -484,11 +519,14 @@ class VpdFallbackCore : public CoreBase {
         int dir = richtung;
         if (dir > 0 && u_grenze >= u_max - 0.05f) dir = -1;
         if (dir < 0 && u_grenze <= u_min + 0.05f) dir = (u_grenze < u_max - 0.05f) ? 1 : 0;
-        float d, ende;
-        if (dir != 0 && gerade(n_mess, d, ende)) {
+        float d, ende, noise;
+        if (dir != 0 && gerade(n_mess, d, ende, noise) &&
+            noise <= std::max(0.005f, MARGE) &&
+            fabsf(d) * n_mess * DT <= std::max(0.02f, band)) {
+          test_noise_ = noise;
           drift = d; v0 = ende; e0 = ende - ziel;
           g_alt = u_grenze; u_alt = u; test_dir = dir; t_test = 0; test = true;
-          float xs = logf(u_grenze + U0) + dir * logf(1.0f + schritt / 100.0f);
+          float xs = logf(u_grenze + U0) + dir * logf(1.0f + std::max(5.0f, schritt * step_scale_) / 100.0f);
           u_grenze = begrenze(expf(xs) - U0, u_min, u_max);
           u = u_grenze;                              // Luefter folgt sofort
           const char *wohin = dir < 0 ? fx.down : fx.up;
@@ -500,7 +538,7 @@ class VpdFallbackCore : public CoreBase {
       }
 
       // ================= EBENE 1: GRUNDREGLER =================
-      if (!sicher) {
+      if (!sicher && !test) {
         float x = logf(u + U0) - ki * (tau * (et - et_vorher) + et * DT);
         x = begrenze(x, logf(u_min + U0), logf(u_grenze + U0));
         u = limit_fan_increase(u, expf(x) - U0,
@@ -624,6 +662,9 @@ class VpdFallbackCore : public CoreBase {
   // ---------- Speicher (war "static" im Lambda, gemeinsamer Teil in CoreBase) ----------
   bool gestartet = false;
   float ziel_vorher = NAN;
+  float ramp_start_{NAN};
+  float previous_transition_{NAN};
+  bool target_transition_{false};
   float u = 30.0f;                   // Stellwert des Grundreglers in %
   float u_grenze = 100.0f;           // Obergrenze aus dem Grenzfinder in %
   float et_vorher = 0.0f;            // e_t des letzten Takts
@@ -643,6 +684,7 @@ class VpdFallbackCore : public CoreBase {
   int t_test = 0, test_dir = 0;
   float g_alt = 0, u_alt = 0, v0 = 0, e0 = 0;
   float drift = NAN, dv = NAN, j0 = NAN, j1 = NAN;
+  float test_noise_{0.0f}, step_scale_{1.0f}, last_test_vpd_{NAN};
 
   std::string grund = "Restart";     // letztes Ereignis, nur fuers Log
   std::string zustand_vorher, grund_vorher;

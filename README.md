@@ -51,6 +51,26 @@ VPD. The fallback limit-search strategy is retained.
 
 ### Smoother regulation
 
+Target and day/night changes start their ramp at the last active target.
+A change from 1.3 to 1.1 kPa stays between those values even if measured VPD is
+only 0.95 kPa. Repeated changes start at the current intermediate target.
+Changing the duration during a ramp spreads the remaining distance over the
+newly selected duration, starting from the current intermediate target.
+`transition: 0` cancels an active ramp immediately. Recovery after tent opening
+or a sensor-source change still starts from measured VPD.
+
+The economic fan ceiling now includes a margin for moisture-load uncertainty.
+Changes exceeding 0.5 percentage points must persist in the same direction for
+three control ticks before the existing ceiling rate applies. Setting
+`vpd_sacrifice: 0` removes the economic cap immediately. Fallback limit tests
+require low background noise/drift and hold the test output constant. Disturbed
+or inconclusive results are discarded; inconclusive trials increase the wait
+and reduce the next test step.
+
+A [replay tool](tools/README.md) accepts real sensor recordings, including Home
+Assistant history exports. It checks controller decisions, not the hypothetical
+climate response to a different fan output.
+
 Isolated VPD jumps more than 0.1 kPa from the median of the last three control
 ticks are rejected. Smaller changes pass immediately; sustained large changes
 are accepted on the second sample. The main controller also uses a
@@ -158,10 +178,11 @@ Every 10 s the controller
    nothing inside the deadband,
 5. applies the safety: `output = max(controller, temperature P, humidity P)`.
 
-After a light change and after closing the tent, the effective target starts
-at the measured VPD and moves to the target within the *setpoint transition*
-time, so the fan does not fight a gap that heating up or cooling down closes
-on its own.
+After a target or light-phase change, the effective target moves from the last
+active target to the new target within the *setpoint transition* time. After
+closing the tent or changing the sensor source, recovery starts from measured
+VPD instead. This distinction prevents ordinary day/night changes from moving
+the target below both configured targets.
 
 The direction is fixed: more exhaust means drier air and a higher VPD. If
 your room air is wetter than the tent air, this controller is not for you.

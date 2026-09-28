@@ -6,6 +6,28 @@
 namespace esphome {
 namespace vpd_kalman {
 
+// Confirm sustained economic-limit changes; ignore sub-percentage-point jitter.
+class ConfirmedLimit {
+ public:
+  void reset() { this->value_ = NAN; this->direction_ = 0; this->ticks_ = 0; }
+  float update(float candidate) {
+    if (!std::isfinite(this->value_)) this->value_ = candidate;
+    const float delta = candidate - this->value_;
+    const int direction = delta > 0.5f ? 1 : (delta < -0.5f ? -1 : 0);
+    if (direction == 0 || direction != this->direction_) this->ticks_ = 0;
+    this->direction_ = direction;
+    if (direction != 0 && ++this->ticks_ >= 3) {
+      this->value_ = candidate;
+      this->ticks_ = 0;
+    }
+    return this->value_;
+  }
+
+ protected:
+  float value_{NAN};
+  int direction_{0}, ticks_{0};
+};
+
 // Reject isolated jumps >0.1 kPa relative to a three-sample median. Small
 // changes pass immediately, avoiding the dead time of a permanent median filter.
 // A sustained large change is accepted after two samples.

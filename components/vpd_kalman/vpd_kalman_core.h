@@ -399,7 +399,8 @@ class VpdKalmanCore : public CoreBase {
     kalman_neu = true; e_neu = false;
     this->vpd_median_.reset();
     this->vpd_response_.reset();
-    ziel_eff = NAN; fuehr_starten = false;
+    this->economic_limit_.reset();
+    ziel_eff = NAN; fuehr_starten = false; ramp_start_ = NAN;
     zustand_vorher.clear();
     grund = reason;
     previous_target_ = par(in.night_has_state && in.night ? in.target_night : in.target_day, 1.0f);
@@ -498,7 +499,10 @@ class VpdKalmanCore : public CoreBase {
     const bool signal_reset = !zelt_ok || in.tent_open ||
         (quelle_vorher >= 0 && quelle_vorher != (int) unten) ||
         (nacht_bekannt && nacht != nacht_vorher) || (offen_vorher && !in.tent_open);
-    if (signal_reset) { this->vpd_median_.reset(); this->vpd_response_.reset(); }
+    if (signal_reset) {
+      this->vpd_median_.reset(); this->vpd_response_.reset();
+      this->economic_limit_.reset();
+    }
     const float filtered_vpd = zelt_ok
         ? this->vpd_response_.update(this->vpd_median_.update(vpd_regel_anz), 10.0f,
                                      tuning_or(tn.control_smoothing, 10.0f)) : NAN;
@@ -586,6 +590,7 @@ class VpdKalmanCore : public CoreBase {
       u_kand = -1.0f; t_kand = 0;             // Kandidat gehoert zur alten Phase
       fuehr_starten = true;
       // Bei offenem Zelt bleibt der Luefter, wo er ist
+      ramp_start_ = std::isfinite(ziel_eff) ? ziel_eff : this->previous_target_;
       if (auto_an && !offen && u_phase[nacht ? 1 : 0] > 0.0f) {
         u = begrenze(u_phase[nacht ? 1 : 0], u_min, u_max);
       }
@@ -598,8 +603,10 @@ class VpdKalmanCore : public CoreBase {
       grund = nacht ? tx.r_lights_off : tx.r_lights_on;
     }
 
-    if (std::isfinite(this->previous_target_) && fabsf(ziel - this->previous_target_) > 0.0005f)
+    if (std::isfinite(this->previous_target_) && fabsf(ziel - this->previous_target_) > 0.0005f) {
       fuehr_starten = true;
+      ramp_start_ = std::isfinite(ziel_eff) ? ziel_eff : this->previous_target_;
+    }
     this->previous_target_ = ziel;
 
     // ---------- 2. Umrechnen und 4. Kalman-Filter ----------
@@ -668,13 +675,21 @@ class VpdKalmanCore : public CoreBase {
 
       // ---------- 5. Sinnvolles Maximum (laufend, in jeder Betriebsart) ----------
       // Mit gelernter Kennlinie, sobald die Bank klar besser vorhersagt
+      // Do not classify uncertain moisture removal as a negligible benefit.
+      const float load_upper = kl + sqrtf(std::max(0.0f, p11));
       float ziel_max = verzicht > 0.0f
-          ? u_von(1.0f / (verzicht / kl + 1.0f / q_von(u_max))) : u_max;
+          ? u_von(1.0f / (verzicht / load_upper + 1.0f / q_von(u_max))) : u_max;
 #ifdef USE_VPD_FAN_CURVE
       if (this->learn_curve_ && this->bank_.active())
-        ziel_max = this->bank_.sensible_max(verzicht, u_max);
+        ziel_max = std::max(ziel_max, this->bank_.sensible_max(verzicht, u_max));
 #endif
       ziel_max = begrenze(ziel_max, u_min, u_max);
+      if (verzicht != this->previous_sacrifice_) {
+        this->economic_limit_.reset();
+        this->previous_sacrifice_ = verzicht;
+      }
+      ziel_max = this->economic_limit_.update(ziel_max);
+      if (verzicht <= 0.0f) u_max_s = u_max;
       if (std::isnan(u_max_s)) u_max_s = ziel_max;   // erster Wert direkt
       u_max_s += begrenze(ziel_max - u_max_s, -MAX_RATE * DT, MAX_RATE * DT);
     }
@@ -688,7 +703,7 @@ class VpdKalmanCore : public CoreBase {
     if (!auto_an) {
       // ================= HAND =================
       ausgang = std::max(par(in.manual_speed, 50.0f), this->manual_safety_floor_);
-      fuehr_starten = false; ziel_eff = NAN;  // kein alter Übergang beim Einschalten
+      fuehr_starten = false; ziel_eff = NAN; ramp_start_ = NAN;  // kein alter Übergang beim Einschalten
       if (in.safety_in_manual && !zelt_ok)
         snprintf(zustand, sizeof(zustand), "%s", tx.tent_sensor_error);
       else if (in.safety_in_manual && u_sicher > par(in.manual_speed, 50.0f))
@@ -726,19 +741,26 @@ class VpdKalmanCore : public CoreBase {
       // ---------- 6. Soll mit Sollwert-Übergang ----------
       if (fuehr_starten) {
         fuehr_starten = false;
-        float abstand = fabsf(ziel - vpd_regel);
-        if (uebergang > 0.0f && abstand > band) {
-          ziel_eff = vpd_regel;
+        target_transition_ = std::isfinite(ramp_start_);
+        const float start = target_transition_ ? ramp_start_ : vpd_regel;
+        ramp_start_ = NAN;
+        float abstand = fabsf(ziel - start);
+        if (uebergang > 0.0f && abstand > (target_transition_ ? 0.0005f : band)) {
+          ziel_eff = start;
           fuehr_rate = abstand / (uebergang / DT);
         } else {
           ziel_eff = NAN;
         }
       }
+      if (uebergang <= 0.0f) ziel_eff = NAN;
+      if (std::isfinite(ziel_eff) && uebergang != previous_transition_)
+        fuehr_rate = fabsf(ziel - ziel_eff) / (uebergang / DT);
+      previous_transition_ = uebergang;
       if (!std::isnan(ziel_eff)) {
         float richtung = ziel > ziel_eff ? 1.0f : -1.0f;
         ziel_eff += richtung * fuehr_rate;
         // VPD ist von selbst schon weiter Richtung Ziel -> mitgehen
-        if ((vpd_regel - ziel_eff) * richtung > 0.0f) ziel_eff = vpd_regel;
+        if (!target_transition_ && (vpd_regel - ziel_eff) * richtung > 0.0f) ziel_eff = vpd_regel;
         // Ziel erreicht oder ueberschritten -> Übergang vorbei
         if ((ziel - ziel_eff) * richtung <= 0.0f) ziel_eff = NAN;
       }
@@ -919,6 +941,9 @@ class VpdKalmanCore : public CoreBase {
   FanCurveBank bank_;
 #endif
   float previous_target_{NAN};
+  float ramp_start_{NAN};
+  float previous_transition_{NAN};
+  bool target_transition_{false};
 
   // ---------- Speicher (war "static" im Lambda, gemeinsamer Teil in CoreBase) ----------
   bool gestartet = false;
@@ -931,6 +956,8 @@ class VpdKalmanCore : public CoreBase {
   float ke = 0.0f;                  // Kalman: wahrer Ueberschuss E (kPa)
   float kl = NAN;                   // Kalman: Last L (kPa)
   float p00 = 0, p01 = 0, p11 = 0;  // Kovarianz
+  ConfirmedLimit economic_limit_;
+  float previous_sacrifice_{NAN};
   bool kalman_neu = false;          // nach "Zelt offen": E neu auf den Messwert
   bool e_neu = false;               // nach Sensorwechsel: nur E neu auf den Messwert
   float ziel_eff = NAN;             // wirksames Ziel im Sollwert-Übergang (NAN = keiner)

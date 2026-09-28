@@ -11,12 +11,14 @@ on:
     paths:
       - "components/**"
       - "tests/**"
+      - "tools/**"
       - "example.yaml"
       - ".github/workflows/build.yml"
   pull_request:
     paths:
       - "components/**"
       - "tests/**"
+      - "tools/**"
       - "example.yaml"
       - ".github/workflows/build.yml"
   schedule:

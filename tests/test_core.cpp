@@ -53,17 +53,55 @@ template<typename Controller> static void target_ramp() {
   tick(core, in, out, 30);
   in.target_day = 1.8f;
   tick(core, in, out);
-  assert(out.target_active > out.control_vpd);
-  assert(out.target_active < out.control_vpd + 0.01f);
+  assert(out.target_active > 1.0f);
+  assert(out.target_active < 1.01f);
   tick(core, in, out, 271);
   assert(std::fabs(out.target_active - 1.8f) < 0.001f);
   in.target_day = 0.5f;
   tick(core, in, out);
-  assert(out.target_active < out.control_vpd && out.target_active > 0.5f);
+  assert(out.target_active < 1.8f && out.target_active > 1.79f);
   in.transition = 0;
   in.target_day = 1.3f;
   tick(core, in, out);
   assert(out.target_active == 1.3f);
+  in.transition = 45;
+  in.target_night = 1.1f;
+  in.night = true;
+  tick(core, in, out);
+  assert(out.control_vpd < 1.1f);
+  assert(out.target_active > 1.29f && out.target_active < 1.3f);
+  for (int i = 0; i < 270; i++) {
+    const float previous = out.target_active;
+    tick(core, in, out);
+    assert(out.target_active <= previous && out.target_active >= 1.1f);
+  }
+  assert(out.target_active == 1.1f);
+  in.target_night = 1.5f;
+  tick(core, in, out, 30);
+  const float interrupted = out.target_active;
+  in.target_night = 1.2f;
+  tick(core, in, out);
+  assert(out.target_active >= interrupted && out.target_active < interrupted + 0.01f);
+  in.transition = 0;
+  tick(core, in, out);
+  assert(out.target_active == 1.2f);
+  in.transition = 45;
+  in.target_night = 1.8f;
+  tick(core, in, out, 30);
+  const float before_shortening = out.target_active;
+  in.transition = 1;
+  for (int i = 1; i <= 6; i++) {
+    tick(core, in, out);
+    const float expected = before_shortening + (1.8f - before_shortening) * i / 6.0f;
+    assert(std::fabs(out.target_active - expected) < 0.0001f);
+  }
+  assert(std::fabs(out.target_active - 1.8f) < 0.0001f);
+  in.target_night = 1.1f;
+  tick(core, in, out, 2);
+  const float before_lengthening = out.target_active;
+  in.transition = 2;
+  tick(core, in, out);
+  assert(std::fabs(out.target_active - (before_lengthening - (before_lengthening - 1.1f) / 12)) < 0.0001f);
 }
 
 template<typename Controller> static void invalid_inputs_and_manual_protection() {
@@ -342,7 +380,65 @@ static void learning_persistence() {
 }
 #endif
 
+class FallbackProbe : public VpdFallbackCore {
+ public:
+  bool testing() const { return test; }
+};
+
+static void economic_confirmation() {
+  ConfirmedLimit limit;
+  assert(limit.update(50) == 50);
+  for (int i = 0; i < 20; i++) assert(limit.update(i % 2 ? 49 : 51) == 50);
+  assert(limit.update(55) == 50);
+  assert(limit.update(55) == 50);
+  assert(limit.update(55) == 55);
+  VpdKalmanCore core;
+  Inputs in = climate();
+  Outputs out;
+  in.sacrifice = 0.1f;
+  tick(core, in, out, 100);
+  assert(out.sensible_max < 100);
+  in.sacrifice = 0;
+  tick(core, in, out);
+  assert(out.sensible_max == 100);  // Explicit opt-out does not wait for a ramp.
+}
+
+static void fallback_test_quality() {
+  FallbackProbe stable, drifting;
+  Inputs in = climate();
+  in.target_day = 2;
+  in.rh_max = 95;
+  in.transition = 0;
+  in.tuning.fallback_time_constant = 0.5f;
+  in.tuning.fallback_smoothing = 10;
+  Outputs out;
+  bool started = false;
+  for (int i = 0; i < 200; i++) {
+    tick(stable, in, out);
+    if (stable.testing()) { started = true; break; }
+  }
+  assert(started);
+  const float test_output = out.fan_output;
+  tick(stable, in, out);
+  assert(out.fan_output == test_output);  // PI cannot change the test stimulus.
+  in.rh -= 5;  // A raw VPD jump must cancel the experiment, not be learned.
+  tick(stable, in, out);
+  assert(!stable.testing());
+  bool aborted = false;
+  for (const auto &event : out.events)
+    if (event.a.find("Climate disturbance") != std::string::npos) aborted = true;
+  assert(aborted);
+  for (int i = 0; i < 200; i++) {
+    const float vpd = 0.6f + 0.008f * (i % 60);
+    in.rh = 100 * (svp(23) - vpd) / svp(25);
+    tick(drifting, in, out);
+    assert(!drifting.testing());  // No experiments while the background drifts.
+  }
+}
+
 int main() {
+  economic_confirmation();
+  fallback_test_quality();
   freshness();
   target_ramp<VpdKalmanCore>();
   target_ramp<VpdFallbackCore>();
