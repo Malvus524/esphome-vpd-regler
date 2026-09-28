@@ -346,16 +346,46 @@ Only created if you add the key (with at least a `name`), see
 | `moisture_load` | kPa | Kalman estimate of the load, proportional to transpiration. |
 | `next_step_benefit` | kPa | VPD gain of the next fan step (+15 % airflow). |
 | `vpd_at_max` | kPa | VPD that *Fan maximum automatic* would reach at the same temperature. |
+| `learned_airflow_50` | % | [Fan curve learning](#fan-curve-learning): airflow at 50 % fan in % of full. |
+| `learned_sensor_offset` | % | Learned offset of the tent sensor against the room sensor (%RH). |
+| `learned_sensor_lag` | s | Learned lag of the tent sensor. |
+| `learned_sensible_max` | % | Sensible maximum with the learned curve, also while it is not used yet. |
 | `state` | text | E.g. *In band*, *Regulating*, *At sensible maximum*, *Target unreachable*, *Safety (temperature)*, *Tent open - paused (5 min)*. |
 | `temperature_protection` | binary | ON while the temperature safety raises the fan. |
 | `humidity_protection` | binary | ON while the humidity safety raises the fan. |
 | `fallback_active` | binary | ON while the fallback controller drives the fan. |
+| `fan_curve_learned` | binary | ON while the sensible maximum uses the learned fan curve. |
 | `limit_finder_drift` | kPa/min | Fallback: VPD drift measured before the last test step. |
 | `limit_finder_vpd_change` | kPa | Fallback: effect of the last test step, without the drift. |
 | `limit_finder_cost_before` | - | Fallback: `J` before the last test step. |
 | `limit_finder_cost_after` | - | Fallback: `J` after the last test step (with margin). |
 
 ---
+
+## Fan curve learning
+
+The Kalman controller assumes a straight fan curve (`airflow_at_zero`) and
+tent and room sensor that agree. Many fans move most of their air well below
+100 %, and two humidity sensors often differ by a few %RH. Both shift the
+*sensible maximum*. The component learns them by itself, without test runs
+and without a setting:
+
+- A bank of 720 small filters runs alongside, each one assumption about fan
+  curve, tent sensor offset (-4 ... +4 %RH) and tent sensor lag (0-60 s),
+  always on the own tent sensor. Each one scores how well it predicts the
+  next reading, but only in the 10 min after a fan change and only if nothing
+  unexpected happened (tent opened without the switch, watering, light
+  change). Scores fade with a half life of 48 h and survive a restart.
+- The learned curve is used only when it predicts clearly better than the
+  configured one and has been stable for 48 h. Then only the sensible maximum
+  uses it, the control speed stays as it is. Until then the controller works
+  exactly as without learning.
+- It takes a few days. A fan that matches `airflow_at_zero` is never taken
+  over.
+
+Optional diagnostics show what it has learned: `learned_airflow_50`,
+`learned_sensor_offset`, `learned_sensor_lag`, `learned_sensible_max` (also
+while not in use, to compare) and `fan_curve_learned`.
 
 ## Fallback controller
 
@@ -426,7 +456,8 @@ constant, rate, fan cost, test step) are [tuning parameters](#tuning-parameters-
 Without room sensor the settings *Allowed VPD sacrifice* and *Controller
 speed* are not created and `time_constant` is ignored. The Kalman-only
 diagnostics (`excess`, `excess_target`, `moisture_load`,
-`next_step_benefit`, `vpd_at_max`) and tuning parameters are rejected.
+`next_step_benefit`, `vpd_at_max`, the fan curve diagnostics) and tuning
+parameters are rejected.
 
 ## Tuning parameters (optional)
 

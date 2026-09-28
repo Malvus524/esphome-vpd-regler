@@ -371,16 +371,47 @@ akzeptieren die üblichen Sensor-Optionen.
 | `moisture_load` | kPa | Kalman-Schätzung der Last, proportional zur Transpiration. |
 | `next_step_benefit` | kPa | VPD-Gewinn der nächsten Lüfterstufe (+15 % Luftstrom). |
 | `vpd_at_max` | kPa | VPD, das *Fan maximum automatic* bei gleicher Temperatur erreichen würde. |
+| `learned_airflow_50` | % | [Lüfterkennlinie lernen](#lüfterkennlinie-lernen): Luftstrom bei 50 % Lüfter in % des vollen. |
+| `learned_sensor_offset` | % | Gelernter Versatz des Zeltsensors gegenüber dem Raumsensor (%rF). |
+| `learned_sensor_lag` | s | Gelernte Trägheit des Zeltfühlers. |
+| `learned_sensible_max` | % | Sinnvolles Maximum mit der gelernten Kennlinie, auch solange sie noch nicht genutzt wird. |
 | `state` | Text | Mit `language: de` z. B. *Im Band*, *Regeln*, *An sinnvollem Maximum*, *Ziel unerreichbar*, *Sicherheit (Temperatur)*, *Zelt offen - pausiert (5 min)*. |
 | `temperature_protection` | binär | ON, solange der Temperaturschutz den Lüfter anhebt. |
 | `humidity_protection` | binär | ON, solange der Feuchteschutz den Lüfter anhebt. |
 | `fallback_active` | binär | ON, solange der Ersatzregler den Lüfter steuert. |
+| `fan_curve_learned` | binär | ON, solange das sinnvolle Maximum die gelernte Kennlinie nutzt. |
 | `limit_finder_drift` | kPa/min | Ersatzregler: VPD-Drift, gemessen vor dem letzten Testschritt. |
 | `limit_finder_vpd_change` | kPa | Ersatzregler: Wirkung des letzten Testschritts, ohne die Drift. |
 | `limit_finder_cost_before` | - | Ersatzregler: `J` vor dem letzten Testschritt. |
 | `limit_finder_cost_after` | - | Ersatzregler: `J` nach dem letzten Testschritt (mit Marge). |
 
 ---
+
+## Lüfterkennlinie lernen
+
+Der Kalman-Regler nimmt eine gerade Lüfterkennlinie an (`airflow_at_zero`)
+und dass Zelt- und Raumsensor gleich messen. Viele Lüfter fördern schon weit
+unter 100 % fast ihre volle Luftmenge, und zwei Feuchtesensoren weichen oft
+um einige %rF voneinander ab. Beides verschiebt das *sinnvolle Maximum*. Die
+Komponente lernt beides selbst, ohne Testläufe und ohne Einstellung:
+
+- Eine Bank aus 720 kleinen Filtern läuft mit, jeder eine Annahme über
+  Kennlinie, Versatz des Zeltsensors (-4 ... +4 %rF) und Trägheit des
+  Zeltfühlers (0-60 s), immer mit dem eigenen Zeltsensor. Jeder sammelt
+  Punkte dafür, wie gut er den nächsten Messwert vorhersagt, aber nur in den
+  10 min nach einer Lüfteränderung und nur, wenn nichts Unerwartetes passiert
+  ist (Zelt ohne Schalter geöffnet, Gießen, Lichtwechsel). Die Punkte
+  verblassen mit einer Halbwertszeit von 48 h und überstehen einen Neustart.
+- Die gelernte Kennlinie wird erst genutzt, wenn sie klar besser vorhersagt
+  als die eingestellte und 48 h stabil war. Dann nutzt sie nur das sinnvolle
+  Maximum, das Regeltempo bleibt. Bis dahin arbeitet der Regler genau wie
+  ohne Lernen.
+- Das dauert einige Tage. Ein Lüfter, der zu `airflow_at_zero` passt, wird
+  nie übernommen.
+
+Optionale Diagnosen zeigen, was sie gelernt hat: `learned_airflow_50`,
+`learned_sensor_offset`, `learned_sensor_lag`, `learned_sensible_max` (auch
+solange sie nicht genutzt wird, zum Vergleichen) und `fan_curve_learned`.
 
 ## Ersatzregler
 
@@ -453,7 +484,8 @@ Einstellungen (Zeitkonstante, Rate, Lüfterkosten, Testschritt) sind
 Ohne Raumsensor werden die Einstellungen *Allowed VPD sacrifice* und
 *Controller speed* nicht angelegt und `time_constant` wird ignoriert. Die
 Diagnosen, die nur der Kalman-Regler hat (`excess`, `excess_target`,
-`moisture_load`, `next_step_benefit`, `vpd_at_max`), und seine
+`moisture_load`, `next_step_benefit`, `vpd_at_max`, die Diagnosen der
+Lüfterkennlinie), und seine
 Tuning-Parameter werden abgelehnt.
 
 ## Tuning-Parameter (optional)

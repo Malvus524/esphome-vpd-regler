@@ -165,6 +165,11 @@ SENSORS = {
     "moisture_load": ("mdi:sprout", "kPa", 4, STATE_CLASS_MEASUREMENT, ENTITY_CATEGORY_DIAGNOSTIC),
     "next_step_benefit": ("mdi:trending-up", "kPa", 4, STATE_CLASS_MEASUREMENT, ENTITY_CATEGORY_DIAGNOSTIC),
     "vpd_at_max": ("mdi:arrow-collapse-up", "kPa", 3, STATE_CLASS_MEASUREMENT, ENTITY_CATEGORY_DIAGNOSTIC),
+    # Fan curve learning (vpd_fan_curve.h)
+    "learned_airflow_50": ("mdi:fan-chevron-up", "%", 0, None, ENTITY_CATEGORY_DIAGNOSTIC),
+    "learned_sensor_offset": ("mdi:water-sync", "%", 1, None, ENTITY_CATEGORY_DIAGNOSTIC),
+    "learned_sensor_lag": ("mdi:timer-sand", "s", 0, None, ENTITY_CATEGORY_DIAGNOSTIC),
+    "learned_sensible_max": ("mdi:fan-chevron-up", "%", 1, None, ENTITY_CATEGORY_DIAGNOSTIC),
     # Fallback controller
     "limit_finder_drift": ("mdi:chart-line-variant", "kPa/min", 4, None, ENTITY_CATEGORY_DIAGNOSTIC),
     "limit_finder_vpd_change": ("mdi:delta", "kPa", 3, None, ENTITY_CATEGORY_DIAGNOSTIC),
@@ -177,6 +182,7 @@ SENSORS = {
 KALMAN_ONLY = {
     "vpd_sacrifice", "speed",
     "excess", "excess_target", "moisture_load", "next_step_benefit", "vpd_at_max",
+    "learned_airflow_50", "learned_sensor_offset", "learned_sensor_lag", "learned_sensible_max", "fan_curve_learned",
     "room_fallback_delay", "room_return_delay", "light_memory_after", "light_memory_delay",
     "sensible_max_rate", "sensor_noise", "load_change_per_hour",
     CONF_FORCE_FALLBACK,
@@ -187,6 +193,7 @@ BINARY_SENSORS = {
     "temperature_protection": (DEVICE_CLASS_HEAT, None),
     "humidity_protection": (DEVICE_CLASS_MOISTURE, None),
     "fallback_active": (None, "mdi:swap-horizontal"),
+    "fan_curve_learned": (None, "mdi:school-outline"),
 }
 
 
@@ -374,7 +381,7 @@ def _check_mode(config):
     # likely a mistake.
     if not _is_fallback(config):
         return config
-    for key in [*SENSORS, CONF_FORCE_FALLBACK]:
+    for key in [*SENSORS, *BINARY_SENSORS, CONF_FORCE_FALLBACK]:
         if key in config and key in KALMAN_ONLY:
             raise cv.Invalid(
                 f"'{key}' needs room_temperature and room_humidity (Kalman controller)", path=[key]
@@ -429,6 +436,7 @@ async def to_code(config):
             _storage_key(keys.get(CONF_CONTROLLER_OUTPUT, f"{base}_controller_output")),
             _storage_key(keys.get(CONF_DAY, f"{base}_day")),
             _storage_key(keys.get(CONF_NIGHT_KEY, f"{base}_night")),
+            _storage_key(f"{base}_fan_curve"),
         )
     )
 

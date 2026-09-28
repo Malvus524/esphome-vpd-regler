@@ -82,6 +82,16 @@ void VpdKalman::setup() {
   this->stored_day_ = fan.saved_u_day;
   this->stored_night_ = fan.saved_u_night;
 
+  // Fan curve learning (Kalman controller only), scores survive a restart
+  if (this->room_temperature_ != nullptr) {
+    FanCurveBank &bank = this->core_.kalman.fan_curve();
+    this->core_.kalman.set_fan_curve_learning(true);
+    this->pref_curve_ = global_preferences->make_preference<FanCurveBank::Stored>(this->key_curve_);
+    if (this->pref_curve_.load(&this->stored_curve_) && bank.load(this->stored_curve_))
+      ESP_LOGD(TAG, "Fan curve: scores restored, %s", bank.active() ? "learned curve in use" : "not in use yet");
+    this->curve_active_saved_ = bank.active();
+  }
+
   // Set the fan right away, not only at the first control tick.
   // Automatic: last stored controller value. Manual: manual speed.
   this->apply_level_(fan.boot_level(this->control_->state, state_of_(this->manual_speed_)));
@@ -183,6 +193,20 @@ void VpdKalman::update() {
     this->stored_night_ = fan.saved_u_night;
     this->pref_night_.save(&this->stored_night_);
   }
+  if (this->room_temperature_ != nullptr) {
+    // Every 6 h, and right away when the learned curve is taken over or given up
+    const FanCurveBank &bank = this->core_.kalman.fan_curve();
+    if (++this->curve_ticks_ >= 2160 || bank.active() != this->curve_active_saved_) {
+      if (bank.active() != this->curve_active_saved_)
+        ESP_LOGI(TAG, "Fan curve: %s (airflow at 50 %%: %.0f %%, offset %+.1f %%RH, sensor lag %.0f s)",
+                 bank.active() ? "learned curve now used for the sensible maximum" : "back to the configured curve",
+                 100.0f * bank.airflow(50.0f), bank.offset(), bank.lag());
+      this->curve_ticks_ = 0;
+      this->curve_active_saved_ = bank.active();
+      bank.save(this->stored_curve_);
+      this->pref_curve_.save(&this->stored_curve_);
+    }
+  }
 
   // Diagnostics
   const Outputs &o = this->out_;
@@ -207,6 +231,15 @@ void VpdKalman::update() {
     this->s_next_step_benefit_->publish_state(o.next_step_benefit);
   if (this->s_vpd_at_max_ != nullptr)
     this->s_vpd_at_max_->publish_state(o.vpd_at_max);
+  if (this->s_learned_airflow_50_ != nullptr)
+    this->s_learned_airflow_50_->publish_state(o.learned_airflow_50);
+  if (this->s_learned_offset_ != nullptr)
+    this->s_learned_offset_->publish_state(o.learned_offset);
+  if (this->s_learned_lag_ != nullptr)
+    this->s_learned_lag_->publish_state(o.learned_lag);
+  if (this->s_learned_sensible_max_ != nullptr)
+    this->s_learned_sensible_max_->publish_state(o.learned_sensible_max);
+  publish_binary_(this->b_curve_, o.fan_curve_active);
   if (this->s_limit_finder_drift_ != nullptr)
     this->s_limit_finder_drift_->publish_state(o.limit_finder_drift);
   if (this->s_limit_finder_vpd_change_ != nullptr)

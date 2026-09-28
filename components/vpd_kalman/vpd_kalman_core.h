@@ -37,7 +37,10 @@
 //  5. Sensible maximum from L: the fan setting at which full fan would only
 //     gain the allowed VPD sacrifice X:
 //       1/q_limit = X / L + 1/q_max
-//     Changes by at most 5 %/min.
+//     Changes by at most 5 %/min. A bank of filters learns the real fan
+//     curve, the tent sensor offset and lag alongside (vpd_fan_curve.h).
+//     Once it predicts clearly better than the configured straight curve,
+//     the sensible maximum uses its curve and load instead.
 //  6. Setpoint transition: after light change and "tent open" the
 //     effective target starts at the measured VPD and moves towards the
 //     target with |target - start| / transition time. If the VPD is
@@ -74,6 +77,8 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+
+#include "vpd_fan_curve.h"
 
 namespace esphome {
 namespace vpd_kalman {
@@ -244,6 +249,12 @@ struct Outputs {
   // Diagnostics, published every tick (NAN = unknown)
   float control_vpd{NAN}, target_active{NAN}, controller_output{NAN}, sensible_max{NAN}, fan_output{NAN},
       excess{NAN}, excess_target{NAN}, moisture_load{NAN}, next_step_benefit{NAN}, vpd_at_max{NAN};
+  // Fan curve learning (Kalman only): airflow at 50 % fan in % of full,
+  // tent sensor offset against the room sensor (%RH), tent sensor lag (s)
+  float learned_airflow_50{NAN}, learned_offset{NAN}, learned_lag{NAN};
+  // Sensible maximum with the learned curve, always (also while not used)
+  float learned_sensible_max{NAN};
+  bool fan_curve_active{false};
   // Fallback controller only
   float limit_finder_drift{NAN}, limit_finder_vpd_change{NAN}, limit_finder_cost_before{NAN},
       limit_finder_cost_after{NAN};
@@ -314,8 +325,18 @@ class VpdKalmanCore : public CoreBase {
     this->lang_ = lang;
     this->grund = TEXTS[lang].r_restart;
   }
-  void set_airflow_at_zero(float q0) { this->q0_ = q0; }
-  void set_time_constant_s(float s) { this->tau_s_ = s; }
+  void set_airflow_at_zero(float q0) {
+    this->q0_ = q0;
+    this->bank_.set_config(this->q0_, this->tau_s_);
+  }
+  void set_time_constant_s(float s) {
+    this->tau_s_ = s;
+    this->bank_.set_config(this->q0_, this->tau_s_);
+  }
+  /// Learn the fan curve (vpd_fan_curve.h). Off by default so that host
+  /// tests can compare the controller bit by bit, the ESPHome glue turns it on.
+  void set_fan_curve_learning(bool on) { this->learn_curve_ = on; }
+  FanCurveBank &fan_curve() { return this->bank_; }
   void set_leaf_max_deviation(float d) { this->leaf_max_dev_ = d; }
 
   /// Current sensible maximum in % (NAN = not known yet).
@@ -513,7 +534,9 @@ class VpdKalmanCore : public CoreBase {
 
     // --- Lichtwechsel ---
     if (t_phase < PHASE_MERKEN) t_phase++;
+    bool licht_jetzt = false;               // fuer die Kennlinien-Bank
     if (nacht_bekannt && nacht != nacht_vorher) {
+      licht_jetzt = true;
       nacht_vorher = nacht;
       t_phase = 0;
       u_kand = -1.0f; t_kand = 0;             // Kandidat gehoert zur alten Phase
@@ -537,6 +560,14 @@ class VpdKalmanCore : public CoreBase {
       e_zelt = svp(T) * RH / 100.0f;
       e_raum = svp(Tr) * RHr / 100.0f;
       e_mess = e_zelt - e_raum;
+    }
+    // Kennlinien-Bank: lernt immer mit dem eigenen Zeltsensor (die Kennlinie
+    // gehoert zum Luefter, Versatz und Traegheit zu diesem Sensor)
+    if (this->learn_curve_) {
+      bool eigen_ok = !std::isnan(in.t) && !std::isnan(in.rh) && raum_ok;
+      float c_eigen = eigen_ok ? svp(in.t) / 100.0f : NAN;
+      this->bank_.step(eigen_ok, eigen_ok ? c_eigen * in.rh : NAN, eigen_ok ? svp(Tr) * RHr / 100.0f : NAN,
+                       c_eigen, aus_vorher, licht_jetzt, offen, L_REL_H, R_MESS);
     }
     // Bei offenem Zelt gilt E = L/q nicht (Luft geht nicht nur durch den
     // Luefter) - Filter und sinnvolles Maximum pausieren.
@@ -586,7 +617,10 @@ class VpdKalmanCore : public CoreBase {
       kl = std::max(kl, L_MIN);
 
       // ---------- 5. Sinnvolles Maximum (laufend, in jeder Betriebsart) ----------
-      float ziel_max = verzicht > 0.0f
+      // Mit gelernter Kennlinie, sobald die Bank klar besser vorhersagt
+      float ziel_max = (this->learn_curve_ && this->bank_.active())
+          ? this->bank_.sensible_max(verzicht, u_max)
+          : verzicht > 0.0f
           ? u_von(1.0f / (verzicht / kl + 1.0f / q_von(u_max))) : u_max;
       ziel_max = begrenze(ziel_max, u_min, u_max);
       if (std::isnan(u_max_s)) u_max_s = ziel_max;   // erster Wert direkt
@@ -793,6 +827,13 @@ class VpdKalmanCore : public CoreBase {
     out.moisture_load = kl;
     out.next_step_benefit = nutzen;
     out.vpd_at_max = vpd_max;
+    if (this->learn_curve_) {
+      out.learned_airflow_50 = 100.0f * this->bank_.airflow(50.0f);
+      out.learned_offset = this->bank_.offset();
+      out.learned_lag = this->bank_.lag();
+      out.learned_sensible_max = begrenze(this->bank_.sensible_max(verzicht, u_max), u_min, u_max);
+      out.fan_curve_active = this->bank_.active();
+    }
   }
 
  protected:
@@ -800,6 +841,8 @@ class VpdKalmanCore : public CoreBase {
   float q0_{0.2f};
   float tau_s_{21.0f};
   float leaf_max_dev_{6.0f};
+  bool learn_curve_{false};
+  FanCurveBank bank_;
 
   // ---------- Speicher (war "static" im Lambda, gemeinsamer Teil in CoreBase) ----------
   bool gestartet = false;

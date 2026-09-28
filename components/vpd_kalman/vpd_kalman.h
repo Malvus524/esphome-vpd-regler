@@ -80,10 +80,11 @@ class VpdKalman : public PollingComponent {
   // Tuning parameter as fixed value or as number entity
   void set_tuning(TuningKey key, float value) { this->tuning_value_[key] = value; }
   void set_tuning_number(TuningKey key, VpdNumber *n) { this->tuning_number_[key] = n; }
-  void set_storage_keys(uint32_t output, uint32_t day, uint32_t night) {
+  void set_storage_keys(uint32_t output, uint32_t day, uint32_t night, uint32_t fan_curve) {
     this->key_u_ = output;
     this->key_day_ = day;
     this->key_night_ = night;
+    this->key_curve_ = fan_curve;
   }
 
   // Settings
@@ -126,6 +127,11 @@ class VpdKalman : public PollingComponent {
   void set_moisture_load_sensor(sensor::Sensor *s) { this->s_moisture_load_ = s; }
   void set_next_step_benefit_sensor(sensor::Sensor *s) { this->s_next_step_benefit_ = s; }
   void set_vpd_at_max_sensor(sensor::Sensor *s) { this->s_vpd_at_max_ = s; }
+  void set_learned_airflow_50_sensor(sensor::Sensor *s) { this->s_learned_airflow_50_ = s; }
+  void set_learned_sensor_offset_sensor(sensor::Sensor *s) { this->s_learned_offset_ = s; }
+  void set_learned_sensor_lag_sensor(sensor::Sensor *s) { this->s_learned_lag_ = s; }
+  void set_learned_sensible_max_sensor(sensor::Sensor *s) { this->s_learned_sensible_max_ = s; }
+  void set_fan_curve_learned_binary_sensor(binary_sensor::BinarySensor *s) { this->b_curve_ = s; }
   void set_limit_finder_drift_sensor(sensor::Sensor *s) { this->s_limit_finder_drift_ = s; }
   void set_limit_finder_vpd_change_sensor(sensor::Sensor *s) { this->s_limit_finder_vpd_change_ = s; }
   void set_limit_finder_cost_before_sensor(sensor::Sensor *s) { this->s_limit_finder_cost_before_ = s; }
@@ -171,17 +177,25 @@ class VpdKalman : public PollingComponent {
   sensor::Sensor *s_control_vpd_{nullptr}, *s_target_active_{nullptr}, *s_controller_output_{nullptr},
       *s_sensible_max_{nullptr}, *s_fan_output_{nullptr}, *s_excess_{nullptr}, *s_excess_target_{nullptr},
       *s_moisture_load_{nullptr}, *s_next_step_benefit_{nullptr}, *s_vpd_at_max_{nullptr};
+  sensor::Sensor *s_learned_airflow_50_{nullptr}, *s_learned_offset_{nullptr}, *s_learned_lag_{nullptr},
+      *s_learned_sensible_max_{nullptr};
   sensor::Sensor *s_limit_finder_drift_{nullptr}, *s_limit_finder_vpd_change_{nullptr},
       *s_limit_finder_cost_before_{nullptr}, *s_limit_finder_cost_after_{nullptr};
   text_sensor::TextSensor *t_state_{nullptr};
-  binary_sensor::BinarySensor *b_temp_prot_{nullptr}, *b_rh_prot_{nullptr}, *b_fallback_{nullptr};
+  binary_sensor::BinarySensor *b_temp_prot_{nullptr}, *b_rh_prot_{nullptr}, *b_fallback_{nullptr},
+      *b_curve_{nullptr};
 
   CallbackManager<void(std::string, std::string)> message_callback_;
 
   // Stored controller values (same layout as restoring float globals)
-  uint32_t key_u_{0}, key_day_{0}, key_night_{0};
-  ESPPreferenceObject pref_u_, pref_day_, pref_night_;
+  uint32_t key_u_{0}, key_day_{0}, key_night_{0}, key_curve_{0};
+  ESPPreferenceObject pref_u_, pref_day_, pref_night_, pref_curve_;
   float stored_u_{NAN}, stored_day_{NAN}, stored_night_{NAN};
+  // Scores of the fan curve bank, saved every 6 h and when it takes over or
+  // gives up, so a restart does not start learning from scratch
+  FanCurveBank::Stored stored_curve_{};
+  uint32_t curve_ticks_{0};
+  bool curve_active_saved_{false};
 };
 
 }  // namespace vpd_kalman
