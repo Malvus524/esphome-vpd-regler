@@ -143,10 +143,53 @@ vpd_kalman:
 
 This creates all settings and switches with English names. Without `night`
 there is one *VPD target*, with it a day and a night target, see
-[Day/night sensor](#daynight-sensor-optional). The controller
+[below](#daynight-sensor-optional). The controller
 starts in **manual mode**: turn on the switch *VPD control* to let it drive
 the fan. A complete example with sensors, diagnostics and notifications is in
 [example.yaml](example.yaml).
+
+### Day/night sensor (optional)
+
+Without `night` the controller always runs in one phase: one *VPD target*,
+one *Leaf offset*, no waiting for day/night after boot. The setpoint
+transition still runs after closing the tent and after a target change.
+
+```yaml
+vpd_kalman:
+  output: fan_pwm
+  temperature: tent_temperature
+  humidity: tent_humidity
+  room_temperature: room_temperature
+  room_humidity: room_humidity
+  target:
+    name: "VPD target"
+    initial_value: 1.1
+```
+
+With `night` you get separate day and night targets. Light changes are
+big, predictable jumps, so the controller then also jumps to the fan speed
+it remembered for the new light phase, starts a setpoint transition and
+uses the leaf offset of the phase. If you want one target but these
+benefits, add `target` as well: it replaces *VPD target day/night*, the leaf
+offsets stay separate.
+
+```yaml
+vpd_kalman:
+  # ...
+  night: lights_off
+  target:
+    name: "VPD target"
+```
+
+| | without `night` | with `night` | with `night` + `target` |
+|---|---|---|---|
+| Targets | `target` | `target_day`, `target_night` | `target` |
+| Leaf offsets | `leaf_offset` | `leaf_offset_day`, `leaf_offset_night` | `leaf_offset_day`, `leaf_offset_night` |
+| Fan speed per light phase, transition on light change | - | yes | yes |
+
+Keys of the other variant are rejected, as are the tuning parameters
+`light_memory_after`, `light_memory_delay`, `boot_wait_night` and
+`storage_keys` `day`/`night` without `night`.
 
 ---
 
@@ -315,47 +358,6 @@ Without room sensor the settings *Allowed VPD sacrifice* and *Controller
 speed* are not created and `time_constant` is ignored. The Kalman-only
 diagnostics (`excess`, `excess_target`, `moisture_load`,
 `next_step_benefit`, `vpd_at_max`) and tuning parameters are rejected.
-
-## Day/night sensor (optional)
-
-Without `night` the controller always runs in one phase: one *VPD target*,
-one *Leaf offset*, no waiting for day/night after boot. The setpoint
-transition still runs after closing the tent and after a target change.
-
-```yaml
-vpd_kalman:
-  output: fan_pwm
-  temperature: tent_temperature
-  humidity: tent_humidity
-  target:
-    name: "VPD target"
-    initial_value: 1.1
-```
-
-With `night` you get separate day and night targets. Light changes are
-big, predictable jumps, so the controller then also jumps to the fan speed
-it remembered for the new light phase, starts a setpoint transition and
-uses the leaf offset of the phase. If you want one target but these
-benefits, add `target` as well: it replaces *VPD target day/night*, the leaf
-offsets stay separate.
-
-```yaml
-vpd_kalman:
-  # ...
-  night: lights_off
-  target:
-    name: "VPD target"
-```
-
-| | without `night` | with `night` | with `night` + `target` |
-|---|---|---|---|
-| Targets | `target` | `target_day`, `target_night` | `target` |
-| Leaf offsets | `leaf_offset` | `leaf_offset_day`, `leaf_offset_night` | `leaf_offset_day`, `leaf_offset_night` |
-| Fan speed per light phase, transition on light change | - | yes | yes |
-
-Keys of the other variant are rejected, as are the tuning parameters
-`light_memory_after`, `light_memory_delay`, `boot_wait_night` and
-`storage_keys` `day`/`night` without `night`.
 
 ## Tuning parameters (optional)
 
